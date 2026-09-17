@@ -26,6 +26,19 @@ function parseLocalDate(dateVal) {
     return new Date(dateVal);
 }
 
+function getLinkedRecordValues(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    return [value];
+}
+
+function getLinkedRecordName(value) {
+    if (!value) return "";
+    if (typeof value === "string") return value.trim().toLowerCase();
+    if (value.name) return value.name.trim().toLowerCase();
+    return String(value).trim().toLowerCase();
+}
+
 // Determine target date (Test override vs. Real Today)
 let targetDate;
 if (TEST_DATE_OVERRIDE) {
@@ -75,8 +88,13 @@ if (activeEnsembles.length === 0) {
     let selectedRehearsalRecord = targetRehearsals.find(r => {
         let groups = r.getCellValue("Ensemble(s)") || r.getCellValue("Ensemble(s) ");
         if (!groups) return false;
-        return groups.some(g => g.name === targetGroupName);
+        return groups.some(g => g && g.name === targetGroupName);
     });
+
+    if (!selectedRehearsalRecord) {
+        output.text(`❌ No rehearsal found for ${targetGroupName} on ${targetDate.toLocaleDateString()}.`);
+        return;
+    }
 
     let selectedRehearsalId = selectedRehearsalRecord.id;
     let rehearsalDisplayDate = selectedRehearsalRecord.getCellValue("Rehearsal Date");
@@ -100,9 +118,9 @@ if (activeEnsembles.length === 0) {
             let studentGroups = student.getCellValue("Ensemble Registered");
             if (!studentGroups) return false;
             if (Array.isArray(studentGroups)) {
-                return studentGroups.some(g => g.name === targetGroupName || g === targetGroupName);
+                return studentGroups.some(g => g && (g.name === targetGroupName || g === targetGroupName));
             }
-            return studentGroups === targetGroupName;
+            return studentGroups === targetGroupName || studentGroups.name === targetGroupName;
         });
 
         groupStudents.sort((a, b) => {
@@ -120,10 +138,10 @@ if (activeEnsembles.length === 0) {
         
         let existingCheckins = attendanceQuery.records.filter(att => {
             let rehearsalLink = att.getCellValue("Rehearsal Date");
-            if (debugMode && att.id.substring(0, 5) === groupStudents[0]?.id.substring(0, 5)) {
+            if (debugMode && groupStudents[0] && att.id.substring(0, 5) === groupStudents[0].id.substring(0, 5)) {
                 output.text(`🔍 Record ${att.id}: rehearsalLink = ${JSON.stringify(rehearsalLink)}`);
             }
-            return rehearsalLink && rehearsalLink.some(r => r.id === selectedRehearsalId);
+            return rehearsalLink && getLinkedRecordValues(rehearsalLink).some(r => r && r.id === selectedRehearsalId);
         });
 
         if (debugMode) {
@@ -131,20 +149,35 @@ if (activeEnsembles.length === 0) {
         }
 
         let checkedInStudentIds = new Set();
+        let checkedInStudentNames = new Set();
+
         existingCheckins.forEach(att => {
             let studentLink = att.getCellValue("Student");
-            if (studentLink && studentLink.length > 0) {
-                checkedInStudentIds.add(studentLink[0].id);
-                if (debugMode) {
-                    output.text(`✅ Checked in: ${studentLink[0].name}`);
+            let linkedStudents = getLinkedRecordValues(studentLink);
+
+            linkedStudents.forEach(student => {
+                if (student && student.id) {
+                    checkedInStudentIds.add(student.id);
                 }
-            }
+                let studentName = getLinkedRecordName(student);
+                if (studentName) {
+                    checkedInStudentNames.add(studentName);
+                }
+                if (debugMode) {
+                    output.text(`✅ Checked in: ${student.name || student.id || student}`);
+                }
+            });
         });
+
+        if (debugMode) {
+            output.text(`✅ Check-in IDs found: ${checkedInStudentIds.size}`);
+            output.text(`✅ Check-in names found: ${checkedInStudentNames.size}`);
+        }
 
         let absenceQuery = await absencesTable.selectRecordsAsync({ fields: ["Student Name", "Absence Date", "Absence Type", arrivalTimeField] });
         let relevantAbsences = absenceQuery.records.filter(abs => {
             let rehearsalLink = abs.getCellValue("Absence Date");
-            return rehearsalLink && rehearsalLink.some(r => r.id === selectedRehearsalId);
+            return rehearsalLink && getLinkedRecordValues(rehearsalLink).some(r => r && r.id === selectedRehearsalId);
         });
 
         let studentAbsenceMapById = new Map();
@@ -183,11 +216,20 @@ if (activeEnsembles.length === 0) {
 
             if (studentLinks && Array.isArray(studentLinks)) {
                 studentLinks.forEach(sLink => {
-                    studentAbsenceMapById.set(sLink.id, absenceObj);
-                    if (sLink.name) {
-                        studentAbsenceMapByName.set(sLink.name.trim().toLowerCase(), absenceObj);
+                    if (sLink && sLink.id) {
+                        studentAbsenceMapById.set(sLink.id, absenceObj);
+                    }
+                    let sName = getLinkedRecordName(sLink);
+                    if (sName) {
+                        studentAbsenceMapByName.set(sName, absenceObj);
                     }
                 });
+            } else if (studentLinks && studentLinks.id) {
+                studentAbsenceMapById.set(studentLinks.id, absenceObj);
+                let sName = getLinkedRecordName(studentLinks);
+                if (sName) {
+                    studentAbsenceMapByName.set(sName, absenceObj);
+                }
             }
         });
 
@@ -199,8 +241,9 @@ if (activeEnsembles.length === 0) {
 
         groupStudents.forEach(student => {
             let studentName = getStudentName(student);
-            let isCheckedIn = checkedInStudentIds.has(student.id);
-            let absenceData = studentAbsenceMapById.get(student.id) || studentAbsenceMapByName.get(studentName.trim().toLowerCase());
+            let studentNameKey = studentName.trim().toLowerCase();
+            let isCheckedIn = checkedInStudentIds.has(student.id) || checkedInStudentNames.has(studentNameKey);
+            let absenceData = studentAbsenceMapById.get(student.id) || studentAbsenceMapByName.get(studentNameKey);
 
             // Check in FIRST (highest priority)
             if (isCheckedIn) {
@@ -241,7 +284,7 @@ if (activeEnsembles.length === 0) {
             output.text(`Rehearsal Date: ${rehearsalDisplayDate} | Last Updated: ${new Date().toLocaleTimeString()}`);
         }
         output.text(`--------------------------------------------------`);
-        output.text(`📊 Summary: ${checkedInStudents.length} Checked In | Forms: ${generalAbsence.length} Absent/Ill/Conflict, ${tardiness.length} Tardiness, ${earlyDismissal.length} Early Dismissal`);
+        output.text(`📊 Summary: ${checkedInStudents.length} Checked In | Forms: ${generalAbsence.length} Absent/Ill/Conflict, ${tardiness.length} Tardiness, ${earlyDismissal.length} Early Dismissal | Missing: ${unexcusedMissingStudents.length}`);
         output.text(`--------------------------------------------------`);
 
         output.markdown(`### Present (${checkedInStudents.length})`);
