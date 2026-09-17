@@ -1,4 +1,4 @@
-// Airtable Script: Attendance report with ensemble-first and date-second selectors
+// Airtable Script: Spreadsheet-style attendance report with ensemble-first and date-second selectors
 const REFRESH_INTERVAL_MS = 60000;
 
 const rostersTable = base.getTable("Ensemble Rosters");
@@ -189,47 +189,57 @@ if (ensembleOptions.length === 0) {
                         }
                     }
 
-                    const present = [];
-                    const absent = [];
-                    const tardy = [];
-                    const early = [];
-                    const missing = [];
+                    const rows = [];
+                    const counts = {
+                        "Checked In": 0,
+                        "Absent": 0,
+                        "Tardy": 0,
+                        "Leaving Early": 0,
+                        "Missing": 0
+                    };
 
                     for (const student of groupStudents) {
                         const name = getStudentName(student);
                         const nameKey = name.toLowerCase();
                         const absence = absencesById.get(student.id) || absencesByName.get(nameKey);
+                        let status = "Missing";
+                        let details = "No check-in or absence request found";
+                        let expectedArrival = "";
 
                         if (checkedInIds.has(student.id) || checkedInNames.has(nameKey)) {
-                            present.push(name);
+                            status = "Checked In";
+                            details = "Attendance recorded";
                         } else if (absence) {
-                            if (absence.type === "Tardiness") {
-                                tardy.push({ name, time: absence.time });
-                            } else if (absence.type === "Early Dismissal") {
-                                early.push(name);
+                            if (absence.type.toLowerCase() === "tardiness") {
+                                status = "Tardy";
+                                details = "Tardiness reported";
+                                expectedArrival = absence.time;
+                            } else if (absence.type.toLowerCase() === "early dismissal") {
+                                status = "Leaving Early";
+                                details = "Early dismissal reported";
                             } else {
-                                absent.push(name);
+                                status = "Absent";
+                                details = absence.type;
                             }
-                        } else {
-                            missing.push(name);
                         }
+
+                        counts[status]++;
+                        rows.push({
+                            Student: name,
+                            Status: status,
+                            Details: details,
+                            "Expected Arrival": expectedArrival
+                        });
                     }
 
                     output.clear();
-                    output.markdown(`## Attendance Report: ${selectedEnsembleName}`);
+                    output.markdown(`## Attendance Spreadsheet: ${selectedEnsembleName}`);
                     output.text(`Rehearsal Date: ${targetDateKey} | Last Updated: ${new Date().toLocaleTimeString()}`);
-                    output.text(`📊 ${present.length} Checked In | ${absent.length} Absent | ${tardy.length} Tardy | ${early.length} Leaving Early | ${missing.length} Missing`);
-
-                    output.markdown(`### Present (${present.length})`);
-                    present.length ? present.forEach(name => output.text(`• ${name}`)) : output.text("None.");
-                    output.markdown(`### Absent (${absent.length})`);
-                    absent.length ? absent.forEach(name => output.text(`• ${name}`)) : output.text("None.");
-                    output.markdown(`### Tardy (${tardy.length})`);
-                    tardy.length ? tardy.forEach(item => output.text(item.time ? `• ${item.name} (Expected Arrival: ${item.time})` : `• ${item.name}`)) : output.text("None.");
-                    output.markdown(`### Leaving Early (${early.length})`);
-                    early.length ? early.forEach(name => output.text(`• ${name}`)) : output.text("None.");
-                    output.markdown(`### Missing (${missing.length})`);
-                    missing.length ? missing.forEach(name => output.text(`• ${name}`)) : output.text("All students accounted for!");
+                    output.text(
+                        `📊 ${counts["Checked In"]} Checked In | ${counts.Absent} Absent | ` +
+                        `${counts.Tardy} Tardy | ${counts["Leaving Early"]} Leaving Early | ${counts.Missing} Missing`
+                    );
+                    output.table(rows);
 
                     await sleep(REFRESH_INTERVAL_MS);
                 }
