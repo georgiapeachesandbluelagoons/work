@@ -1,0 +1,269 @@
+// Configuration: How often to refresh (in milliseconds)
+const REFRESH_INTERVAL_MS = 60000; 
+
+// 🧪 TEST MODE: Enter a date string ("YYYY-MM-DD") to test with future rehearsals.
+// Set to null (e.g., const TEST_DATE_OVERRIDE = null;) to use the real current date.
+const TEST_DATE_OVERRIDE = null; 
+
+// 1. Define your table names
+const rostersTable = base.getTable("Ensemble Rosters");
+const rehearsalsTable = base.getTable("Rehearsals/Concerts");
+const attendanceTable = base.getTable("Attendance");
+const absencesTable = base.getTable("Absence Requests");
+
+// Explicitly use "Student" as the primary field name for rosters
+const rosterPrimaryField = "Student";
+const arrivalTimeField = "Tardy Arrival Time"; 
+
+// Helper to parse dates safely and compare just the year/month/day
+function parseLocalDate(dateVal) {
+    if (!dateVal) return null;
+    if (dateVal instanceof Date) return dateVal;
+    let parts = String(dateVal).split('T')[0].split('-');
+    if (parts.length === 3) {
+        return new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+    }
+    return new Date(dateVal);
+}
+
+// Determine target date (Test override vs. Real Today)
+let targetDate;
+if (TEST_DATE_OVERRIDE) {
+    let parts = TEST_DATE_OVERRIDE.split('-');
+    targetDate = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+} else {
+    targetDate = new Date();
+}
+targetDate.setHours(0, 0, 0, 0);
+
+// Fetch all rehearsals to find what's happening on the target date
+let rehearsalQuery = await rehearsalsTable.selectRecordsAsync({ fields: ["Rehearsal Date", "Ensemble(s)"] });
+
+let targetRehearsals = rehearsalQuery.records.filter(r => {
+    let rawDate = r.getCellValue("Rehearsal Date");
+    let d = parseLocalDate(rawDate);
+    if (!d || isNaN(d)) return false;
+    d.setHours(0, 0, 0, 0);
+    return d.getTime() === targetDate.getTime();
+});
+
+// Extract unique ensemble names scheduled for the target date
+let activeEnsembleSet = new Set();
+targetRehearsals.forEach(r => {
+    let groups = r.getCellValue("Ensemble(s)") || r.getCellValue("Ensemble(s) ");
+    if (groups && Array.isArray(groups)) {
+        groups.forEach(g => {
+            if (g && g.name) activeEnsembleSet.add(g.name);
+        });
+    }
+});
+
+let activeEnsembles = Array.from(activeEnsembleSet);
+
+if (activeEnsembles.length === 0) {
+    output.text(`❌ No ensembles found with a rehearsal scheduled for ${targetDate.toLocaleDateString()}.`);
+} else {
+    // Let user choose from ensembles happening on the target date
+    let targetGroupName = await input.buttonsAsync(
+        TEST_DATE_OVERRIDE 
+            ? `🧪 [TEST MODE: ${TEST_DATE_OVERRIDE}] Select ensemble group:` 
+            : `Select today's ensemble group:`, 
+        activeEnsembles
+    );
+
+    // Find the specific rehearsal record for this ensemble on the target date
+    let selectedRehearsalRecord = targetRehearsals.find(r => {
+        let groups = r.getCellValue("Ensemble(s)") || r.getCellValue("Ensemble(s) ");
+        if (!groups) return false;
+        return groups.some(g => g.name === targetGroupName);
+    });
+
+    let selectedRehearsalId = selectedRehearsalRecord.id;
+    let rehearsalDisplayDate = selectedRehearsalRecord.getCellValue("Rehearsal Date");
+
+    function getStudentName(studentRecord) {
+        let val = studentRecord.getCellValue(rosterPrimaryField);
+        if (!val) return "Unnamed Student";
+        if (typeof val === 'string') return val;
+        if (Array.isArray(val) && val.length > 0) return val[0].name || String(val[0]);
+        if (val.name) return val.name;
+        return String(val);
+    }
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    let isRunning = true;
+    let debugMode = true; // Set to false after debugging
+    
+    while (isRunning) {
+        let rosterQuery = await rostersTable.selectRecordsAsync({ fields: [rosterPrimaryField, "Ensemble Registered"] });
+        let groupStudents = rosterQuery.records.filter(student => {
+            let studentGroups = student.getCellValue("Ensemble Registered");
+            if (!studentGroups) return false;
+            if (Array.isArray(studentGroups)) {
+                return studentGroups.some(g => g.name === targetGroupName || g === targetGroupName);
+            }
+            return studentGroups === targetGroupName;
+        });
+
+        groupStudents.sort((a, b) => {
+            let nameA = getStudentName(a).toLowerCase();
+            let nameB = getStudentName(b).toLowerCase();
+            return nameA.localeCompare(nameB);
+        });
+
+        let attendanceQuery = await attendanceTable.selectRecordsAsync({ fields: ["Student", "Rehearsal Date"] });
+        
+        if (debugMode) {
+            output.text(`🔍 DEBUG: Found ${attendanceQuery.records.length} total attendance records`);
+            output.text(`🔍 Looking for rehearsal ID: ${selectedRehearsalId}`);
+        }
+        
+        let existingCheckins = attendanceQuery.records.filter(att => {
+            let rehearsalLink = att.getCellValue("Rehearsal Date");
+            if (debugMode && att.id.substring(0, 5) === groupStudents[0]?.id.substring(0, 5)) {
+                output.text(`🔍 Record ${att.id}: rehearsalLink = ${JSON.stringify(rehearsalLink)}`);
+            }
+            return rehearsalLink && rehearsalLink.some(r => r.id === selectedRehearsalId);
+        });
+
+        if (debugMode) {
+            output.text(`🔍 Filtered to ${existingCheckins.length} matching this rehearsal`);
+        }
+
+        let checkedInStudentIds = new Set();
+        existingCheckins.forEach(att => {
+            let studentLink = att.getCellValue("Student");
+            if (studentLink && studentLink.length > 0) {
+                checkedInStudentIds.add(studentLink[0].id);
+                if (debugMode) {
+                    output.text(`✅ Checked in: ${studentLink[0].name}`);
+                }
+            }
+        });
+
+        let absenceQuery = await absencesTable.selectRecordsAsync({ fields: ["Student Name", "Absence Date", "Absence Type", arrivalTimeField] });
+        let relevantAbsences = absenceQuery.records.filter(abs => {
+            let rehearsalLink = abs.getCellValue("Absence Date");
+            return rehearsalLink && rehearsalLink.some(r => r.id === selectedRehearsalId);
+        });
+
+        let studentAbsenceMapById = new Map();
+        let studentAbsenceMapByName = new Map();
+
+        relevantAbsences.forEach(abs => {
+            let studentLinks = abs.getCellValue("Student Name");
+            let absenceType = abs.getCellValue("Absence Type");
+            let rawTime = abs.getCellValue(arrivalTimeField);
+            
+            let typeString = "Absence";
+            if (absenceType) {
+                typeString = typeof absenceType === 'string' ? absenceType : (absenceType.name || String(absenceType));
+            }
+
+            let timeString = "";
+            if (rawTime) {
+                timeString = String(rawTime);
+                if (timeString.includes('T')) {
+                    let timePart = timeString.split('T')[1];
+                    if (timePart) {
+                        let parts = timePart.split(':');
+                        if (parts.length >= 2) {
+                            let hours = parseInt(parts[0], 10);
+                            let minutes = parts[1];
+                            let ampm = hours >= 12 ? 'PM' : 'AM';
+                            hours = hours % 12;
+                            hours = hours ? hours : 12;
+                            timeString = `${hours}:${minutes} ${ampm}`;
+                        }
+                    }
+                }
+            }
+
+            let absenceObj = { type: typeString, time: timeString };
+
+            if (studentLinks && Array.isArray(studentLinks)) {
+                studentLinks.forEach(sLink => {
+                    studentAbsenceMapById.set(sLink.id, absenceObj);
+                    if (sLink.name) {
+                        studentAbsenceMapByName.set(sLink.name.trim().toLowerCase(), absenceObj);
+                    }
+                });
+            }
+        });
+
+        let checkedInStudents = [];
+        let generalAbsence = []; 
+        let tardiness = []; 
+        let earlyDismissal = [];
+        let unexcusedMissingStudents = [];
+
+        groupStudents.forEach(student => {
+            let studentName = getStudentName(student);
+            let isCheckedIn = checkedInStudentIds.has(student.id);
+            let absenceData = studentAbsenceMapById.get(student.id) || studentAbsenceMapByName.get(studentName.trim().toLowerCase());
+
+            // Check in FIRST (highest priority)
+            if (isCheckedIn) {
+                checkedInStudents.push(studentName);
+            } else if (absenceData) {
+                // THEN check for absences
+                let typeClean = absenceData.type.trim();
+                switch (typeClean) {
+                    case "Tardiness":
+                        tardiness.push({ name: studentName, time: absenceData.time });
+                        break;
+                    case "Early Dismissal":
+                        earlyDismissal.push(studentName);
+                        break;
+                    case "Illness":
+                        generalAbsence.push(studentName);
+                        break;
+                    case "Absence":
+                        generalAbsence.push(studentName);
+                        break;
+                    case "Schedule conflict with a mandatory rehearsal":
+                        generalAbsence.push(studentName);
+                        break;
+                    default:
+                        generalAbsence.push(`${studentName} (Type: ${typeClean})`);
+                }
+            } else {
+                // No check-in, no absence form = missing
+                unexcusedMissingStudents.push(studentName);
+            }
+        });
+
+        output.clear();
+        output.markdown(`## 🟢 LIVE Attendance Report: ${targetGroupName}`);
+        if (TEST_DATE_OVERRIDE) {
+            output.text(`⚠️ [TEST MODE ACTIVE] Simulated Date: ${rehearsalDisplayDate} | Last Updated: ${new Date().toLocaleTimeString()}`);
+        } else {
+            output.text(`Rehearsal Date: ${rehearsalDisplayDate} | Last Updated: ${new Date().toLocaleTimeString()}`);
+        }
+        output.text(`--------------------------------------------------`);
+        output.text(`📊 Summary: ${checkedInStudents.length} Checked In | Forms: ${generalAbsence.length} Absent/Ill/Conflict, ${tardiness.length} Tardiness, ${earlyDismissal.length} Early Dismissal`);
+        output.text(`--------------------------------------------------`);
+
+        output.markdown(`### Present (${checkedInStudents.length})`);
+        if (checkedInStudents.length === 0) output.text("None yet.");
+        else checkedInStudents.forEach(name => output.text(`• ${name}`));
+
+        output.markdown(`### Absent (${generalAbsence.length})`);
+        if (generalAbsence.length === 0) output.text("None.");
+        else generalAbsence.forEach(name => output.text(`• ${name}`));
+
+        output.markdown(`### Tardy (${tardiness.length})`);
+        if (tardiness.length === 0) output.text("None.");
+        else tardiness.forEach(item => output.text(item.time ? `• ${item.name} (Expected Arrival: ${item.time})` : `• ${item.name}`));
+
+        output.markdown(`### Leaving Early (${earlyDismissal.length})`);
+        if (earlyDismissal.length === 0) output.text("None.");
+        else earlyDismissal.forEach(name => output.text(`• ${name}`));
+
+        output.markdown(`### Missing (${unexcusedMissingStudents.length})`);
+        if (unexcusedMissingStudents.length === 0) output.text("All students accounted for!");
+        else unexcusedMissingStudents.forEach(name => output.text(`• ${name}`));
+
+        await sleep(REFRESH_INTERVAL_MS);
+    }
+}
