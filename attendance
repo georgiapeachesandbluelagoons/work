@@ -1,4 +1,4 @@
-// Airtable Script: Attendance report for a selected rehearsal date
+// Airtable Script: Attendance report with date and ensemble selectors
 const REFRESH_INTERVAL_MS = 60000;
 
 const rostersTable = base.getTable("Ensemble Rosters");
@@ -59,17 +59,34 @@ function absenceMatchesRehearsal(record, rehearsalId, rehearsalDateKey) {
     return linkedIds(value).includes(rehearsalId) || dateKey(value) === rehearsalDateKey;
 }
 
-const selectedDateText = await input.textAsync(
-    "Enter the rehearsal date to view using YYYY-MM-DD:"
-);
-const targetDateKey = selectedDateText.trim();
+function displayDate(key) {
+    const [year, month, day] = key.split("-").map(Number);
+    return new Date(year, month - 1, day).toLocaleDateString();
+}
 
-if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDateKey)) {
-    output.text("❌ Invalid date. Please use the format YYYY-MM-DD, such as 2026-09-16.");
+const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
+    fields: ["Rehearsal Date", "Ensemble(s)"]
+});
+
+const dateOptions = [...new Set(
+    rehearsalQuery.records
+        .map(record => dateKey(record.getCellValue("Rehearsal Date")))
+        .filter(Boolean)
+)].sort((a, b) => b.localeCompare(a));
+
+if (dateOptions.length === 0) {
+    output.text("❌ No rehearsal dates were found.");
 } else {
-    const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
-        fields: ["Rehearsal Date", "Ensemble(s)"]
-    });
+    // Select from existing rehearsal dates instead of typing a date.
+    const selectedDateLabel = await input.buttonsAsync(
+        "Select the rehearsal date to view:",
+        dateOptions.map(key => `${displayDate(key)} (${key})`)
+    );
+
+    const selectedDateIndex = dateOptions
+        .map(key => `${displayDate(key)} (${key})`)
+        .indexOf(selectedDateLabel);
+    const targetDateKey = dateOptions[selectedDateIndex];
 
     const targetRehearsals = rehearsalQuery.records.filter(record =>
         dateKey(record.getCellValue("Rehearsal Date")) === targetDateKey
@@ -88,13 +105,12 @@ if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDateKey)) {
     }
 
     if (ensembleOptions.length === 0) {
-        output.text(`❌ No ensembles found with a rehearsal scheduled for ${targetDateKey}.`);
+        output.text(`❌ No ensembles found for ${targetDateKey}.`);
     } else {
         const selectedEnsembleName = await input.buttonsAsync(
-            `Select the ensemble for ${targetDateKey}:`,
+            `Select the ensemble for ${displayDate(targetDateKey)}:`,
             ensembleOptions.map(option => option.name)
         );
-
         const selectedEnsemble = ensembleOptions.find(option => option.name === selectedEnsembleName);
         const selectedRehearsal = targetRehearsals.find(rehearsal =>
             linkedIds(rehearsal.getCellValue("Ensemble(s)"))
@@ -105,7 +121,6 @@ if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDateKey)) {
             output.text(`❌ Could not find a rehearsal for ${selectedEnsembleName} on ${targetDateKey}.`);
         } else {
             const selectedRehearsalId = selectedRehearsal.id;
-            const selectedRehearsalDateKey = dateKey(selectedRehearsal.getCellValue("Rehearsal Date"));
             const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
             while (true) {
@@ -123,7 +138,7 @@ if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDateKey)) {
                 });
 
                 const checkinRecords = attendanceQuery.records.filter(attendance =>
-                    dateKey(attendance.getCellValue(attendanceDateField)) === selectedRehearsalDateKey &&
+                    dateKey(attendance.getCellValue(attendanceDateField)) === targetDateKey &&
                     linkedIds(attendance.getCellValue(attendanceEnsembleField)).includes(selectedEnsemble.id)
                 );
 
@@ -141,22 +156,16 @@ if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDateKey)) {
                 const absenceQuery = await absencesTable.selectRecordsAsync({
                     fields: ["Student Name", "Absence Date", "Absence Type", arrivalTimeField]
                 });
-
                 const absencesById = new Map();
                 const absencesByName = new Map();
 
                 for (const absence of absenceQuery.records) {
-                    if (!absenceMatchesRehearsal(absence, selectedRehearsalId, selectedRehearsalDateKey)) continue;
-
+                    if (!absenceMatchesRehearsal(absence, selectedRehearsalId, targetDateKey)) continue;
                     const typeValue = absence.getCellValue("Absence Type");
-                    const type = typeof typeValue === "string"
-                        ? typeValue.trim()
-                        : linkedName(typeValue) || "Absence";
                     const data = {
-                        type,
+                        type: typeof typeValue === "string" ? typeValue.trim() : linkedName(typeValue) || "Absence",
                         time: formatTime(absence.getCellValue(arrivalTimeField))
                     };
-
                     for (const student of linkedValues(absence.getCellValue("Student Name"))) {
                         if (student?.id) absencesById.set(student.id, data);
                         const name = linkedName(student);
@@ -164,31 +173,19 @@ if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDateKey)) {
                     }
                 }
 
-                const present = [];
-                const absent = [];
-                const tardy = [];
-                const early = [];
-                const missing = [];
+                const present = [], absent = [], tardy = [], early = [], missing = [];
 
                 for (const student of groupStudents) {
                     const name = getStudentName(student);
                     const nameKey = name.toLowerCase();
-                    const isCheckedIn = checkedInIds.has(student.id) || checkedInNames.has(nameKey);
                     const absence = absencesById.get(student.id) || absencesByName.get(nameKey);
 
-                    if (isCheckedIn) {
+                    if (checkedInIds.has(student.id) || checkedInNames.has(nameKey)) {
                         present.push(name);
                     } else if (absence) {
-                        switch (absence.type) {
-                            case "Tardiness":
-                                tardy.push({ name, time: absence.time });
-                                break;
-                            case "Early Dismissal":
-                                early.push(name);
-                                break;
-                            default:
-                                absent.push(name);
-                        }
+                        if (absence.type === "Tardiness") tardy.push({ name, time: absence.time });
+                        else if (absence.type === "Early Dismissal") early.push(name);
+                        else absent.push(name);
                     } else {
                         missing.push(name);
                     }
@@ -196,7 +193,7 @@ if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDateKey)) {
 
                 output.clear();
                 output.markdown(`## Attendance Report: ${selectedEnsembleName}`);
-                output.text(`Rehearsal Date: ${selectedRehearsalDateKey} | Last Updated: ${new Date().toLocaleTimeString()}`);
+                output.text(`Rehearsal Date: ${targetDateKey} | Last Updated: ${new Date().toLocaleTimeString()}`);
                 output.text(`📊 ${present.length} Checked In | ${absent.length} Absent | ${tardy.length} Tardy | ${early.length} Leaving Early | ${missing.length} Missing`);
 
                 output.markdown(`### Present (${present.length})`);
