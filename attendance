@@ -59,11 +59,13 @@ function absenceMatchesRehearsal(record, rehearsalId, rehearsalDateKey) {
     return linkedIds(value).includes(rehearsalId) || dateKey(value) === rehearsalDateKey;
 }
 
-const selectedDate = await input.dateAsync("Select the rehearsal date to view:");
-const targetDateKey = dateKey(selectedDate);
+const selectedDateText = await input.textAsync(
+    "Enter the rehearsal date to view using YYYY-MM-DD:"
+);
+const targetDateKey = selectedDateText.trim();
 
-if (!targetDateKey) {
-    output.text("❌ No date was selected.");
+if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDateKey)) {
+    output.text("❌ Invalid date. Please use the format YYYY-MM-DD, such as 2026-09-16.");
 } else {
     const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
         fields: ["Rehearsal Date", "Ensemble(s)"]
