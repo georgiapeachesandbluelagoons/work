@@ -1,4 +1,4 @@
-// Airtable Script: Attendance matrix with student rows and rehearsal-date columns
+// Airtable Script: Attendance matrix matching the reference spreadsheet layout
 const rostersTable = base.getTable("Ensemble Rosters");
 const rehearsalsTable = base.getTable("Rehearsals/Concerts");
 const attendanceTable = base.getTable("Attendance");
@@ -38,6 +38,7 @@ function dateKey(value) {
 }
 
 function displayDate(key) {
+    if (!key) return "";
     const [year, month, day] = key.split("-").map(Number);
     return `${month}/${day}/${year}`;
 }
@@ -52,9 +53,7 @@ function getStudentName(record) {
 
 function normalizeAbsenceType(value) {
     if (!value) return "Absent";
-    const text = typeof value === "string"
-        ? value.trim()
-        : String(value.name || value.value || "").trim();
+    const text = typeof value === "string" ? value.trim() : String(value.name || value.value || "").trim();
     const lower = text.toLowerCase();
 
     if (lower.includes("excus")) return "Excused";
@@ -65,6 +64,7 @@ function normalizeAbsenceType(value) {
 
 function absenceMatchesDate(record, rehearsalId, rehearsalDate) {
     const value = record.getCellValue(absenceDateField);
+    if (!value) return false;
     return linkedIds(value).includes(rehearsalId) || dateKey(value) === rehearsalDate;
 }
 
@@ -160,17 +160,20 @@ if (ensembleOptions.length === 0) {
                 }
             }
 
-            const rows = students.map(student => {
+            const rowData = [];
+            for (const student of students) {
                 const row = { "Student Name": getStudentName(student) };
+
                 for (const date of dateOptions) {
-                    const value = statusByStudentDate.get(`${student.id}|${date}`) || "Missing";
-                    row[displayDate(date)] = value;
+                    const value = statusByStudentDate.get(`${student.id}|${date}`);
+                    row[displayDate(date)] = value || "";
                 }
-                return row;
-            });
+
+                rowData.push(row);
+            }
 
             output.text(`## ${selectedEnsembleName}`);
-            output.table(rows);
+            output.table(rowData);
         }
     }
 }
