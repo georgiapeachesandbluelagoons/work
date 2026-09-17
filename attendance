@@ -1,312 +1,210 @@
-// Configuration: How often to refresh (in milliseconds)
-const REFRESH_INTERVAL_MS = 60000; 
+const REFRESH_INTERVAL_MS = 60000;
+const TEST_DATE_OVERRIDE = null;
 
-// 🧪 TEST MODE: Enter a date string ("YYYY-MM-DD") to test with future rehearsals.
-// Set to null (e.g., const TEST_DATE_OVERRIDE = null;) to use the real current date.
-const TEST_DATE_OVERRIDE = null; 
-
-// 1. Define your table names
 const rostersTable = base.getTable("Ensemble Rosters");
 const rehearsalsTable = base.getTable("Rehearsals/Concerts");
 const attendanceTable = base.getTable("Attendance");
 const absencesTable = base.getTable("Absence Requests");
 
-// Explicitly use "Student" as the primary field name for rosters
 const rosterPrimaryField = "Student";
-const arrivalTimeField = "Tardy Arrival Time"; 
+const arrivalTimeField = "Tardy Arrival Time";
 
-// Helper to parse dates safely and compare just the year/month/day
-function parseLocalDate(dateVal) {
-    if (!dateVal) return null;
-    if (dateVal instanceof Date) return dateVal;
-    let parts = String(dateVal).split('T')[0].split('-');
-    if (parts.length === 3) {
-        return new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+function dateKey(value) {
+    if (!value) return null;
+    if (value instanceof Date) {
+        return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
     }
-    return new Date(dateVal);
+    const text = String(value);
+    const match = text.match(/(\d{4})-(\d{2})-(\d{2})/);
+    return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
 }
 
-function getLinkedRecordValues(value) {
+function linkedValues(value) {
     if (!value) return [];
-    if (Array.isArray(value)) return value;
-    return [value];
+    return Array.isArray(value) ? value : [value];
 }
 
-function getLinkedRecordName(value) {
+function linkedName(value) {
     if (!value) return "";
     if (typeof value === "string") return value.trim().toLowerCase();
-    if (value.name) return value.name.trim().toLowerCase();
-    return String(value).trim().toLowerCase();
+    return String(value.name || value.value || value).trim().toLowerCase();
 }
 
-// Determine target date (Test override vs. Real Today)
-let targetDate;
-if (TEST_DATE_OVERRIDE) {
-    let parts = TEST_DATE_OVERRIDE.split('-');
-    targetDate = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
-} else {
-    targetDate = new Date();
+function recordHasLink(value, id) {
+    return linkedValues(value).some(link => link && link.id === id);
 }
-targetDate.setHours(0, 0, 0, 0);
 
-// Fetch all rehearsals to find what's happening on the target date
-let rehearsalQuery = await rehearsalsTable.selectRecordsAsync({ fields: ["Rehearsal Date", "Ensemble(s)"] });
+function getStudentName(record) {
+    const value = record.getCellValue(rosterPrimaryField);
+    if (!value) return "Unnamed Student";
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) return value[0]?.name || String(value[0]);
+    return value.name || String(value);
+}
 
-let targetRehearsals = rehearsalQuery.records.filter(r => {
-    let rawDate = r.getCellValue("Rehearsal Date");
-    let d = parseLocalDate(rawDate);
-    if (!d || isNaN(d)) return false;
-    d.setHours(0, 0, 0, 0);
-    return d.getTime() === targetDate.getTime();
+function groupContains(value, groupName) {
+    return linkedValues(value).some(group => linkedName(group) === groupName.trim().toLowerCase());
+}
+
+function formatTime(value) {
+    if (!value) return "";
+    const text = String(value);
+    const match = text.match(/T(\d{2}):(\d{2})/);
+    if (!match) return text;
+    let hour = parseInt(match[1], 10);
+    const ampm = hour >= 12 ? "PM" : "AM";
+    hour = hour % 12 || 12;
+    return `${hour}:${match[2]} ${ampm}`;
+}
+
+let targetDate = TEST_DATE_OVERRIDE ? new Date(`${TEST_DATE_OVERRIDE}T00:00:00`) : new Date();
+const targetDateKey = dateKey(targetDate);
+
+const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
+    fields: ["Rehearsal Date", "Ensemble(s)"]
 });
 
-// Extract unique ensemble names scheduled for the target date
-let activeEnsembleSet = new Set();
-targetRehearsals.forEach(r => {
-    let groups = r.getCellValue("Ensemble(s)") || r.getCellValue("Ensemble(s) ");
-    if (groups && Array.isArray(groups)) {
-        groups.forEach(g => {
-            if (g && g.name) activeEnsembleSet.add(g.name);
-        });
-    }
-});
+const targetRehearsals = rehearsalQuery.records.filter(record =>
+    dateKey(record.getCellValue("Rehearsal Date")) === targetDateKey
+);
 
-let activeEnsembles = Array.from(activeEnsembleSet);
+const activeEnsembles = [...new Set(
+    targetRehearsals.flatMap(record =>
+        linkedValues(record.getCellValue("Ensemble(s)"))
+            .map(linkedName)
+            .filter(Boolean)
+    )
+)];
 
 if (activeEnsembles.length === 0) {
-    output.text(`❌ No ensembles found with a rehearsal scheduled for ${targetDate.toLocaleDateString()}.`);
-} else {
-    // Let user choose from ensembles happening on the target date
-    let targetGroupName = await input.buttonsAsync(
-        TEST_DATE_OVERRIDE 
-            ? `🧪 [TEST MODE: ${TEST_DATE_OVERRIDE}] Select ensemble group:` 
-            : `Select today's ensemble group:`, 
-        activeEnsembles
-    );
+    output.text(`❌ No ensembles found with a rehearsal scheduled for ${targetDateKey}.`);
+    return;
+}
 
-    // Find the specific rehearsal record for this ensemble on the target date
-    let selectedRehearsalRecord = targetRehearsals.find(r => {
-        let groups = r.getCellValue("Ensemble(s)") || r.getCellValue("Ensemble(s) ");
-        if (!groups) return false;
-        return groups.some(g => g && g.name === targetGroupName);
+const selectedGroup = await input.buttonsAsync(
+    TEST_DATE_OVERRIDE
+        ? `🧪 [TEST MODE: ${TEST_DATE_OVERRIDE}] Select ensemble group:`
+        : "Select today's ensemble group:",
+    activeEnsembles
+);
+
+const selectedRehearsal = targetRehearsals.find(record =>
+    groupContains(record.getCellValue("Ensemble(s)"), selectedGroup)
+);
+
+if (!selectedRehearsal) {
+    output.text(`❌ Could not find a rehearsal for ${selectedGroup} on ${targetDateKey}.`);
+    return;
+}
+
+const rehearsalId = selectedRehearsal.id;
+const rehearsalDateKey = dateKey(selectedRehearsal.getCellValue("Rehearsal Date"));
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const debugMode = true;
+
+while (true) {
+    const rosterQuery = await rostersTable.selectRecordsAsync({
+        fields: [rosterPrimaryField, "Ensemble Registered"]
     });
 
-    if (!selectedRehearsalRecord) {
-        output.text(`❌ No rehearsal found for ${targetGroupName} on ${targetDate.toLocaleDateString()}.`);
-        return;
+    const students = rosterQuery.records
+        .filter(record => groupContains(record.getCellValue("Ensemble Registered"), selectedGroup))
+        .sort((a, b) => getStudentName(a).localeCompare(getStudentName(b)));
+
+    const attendanceQuery = await attendanceTable.selectRecordsAsync({
+        fields: ["Student", "Rehearsal Date"]
+    });
+
+    // Attendance may use either a linked rehearsal field or a normal date field.
+    // Support both formats instead of assuming Rehearsal Date is always a link.
+    const checkinRecords = attendanceQuery.records.filter(record => {
+        const rehearsalValue = record.getCellValue("Rehearsal Date");
+        return recordHasLink(rehearsalValue, rehearsalId) || dateKey(rehearsalValue) === rehearsalDateKey;
+    });
+
+    const checkinIds = new Set();
+    const checkinNames = new Set();
+
+    for (const record of checkinRecords) {
+        const studentValue = record.getCellValue("Student");
+        for (const student of linkedValues(studentValue)) {
+            if (student?.id) checkinIds.add(student.id);
+            const name = linkedName(student);
+            if (name) checkinNames.add(name);
+        }
     }
 
-    let selectedRehearsalId = selectedRehearsalRecord.id;
-    let rehearsalDisplayDate = selectedRehearsalRecord.getCellValue("Rehearsal Date");
-
-    function getStudentName(studentRecord) {
-        let val = studentRecord.getCellValue(rosterPrimaryField);
-        if (!val) return "Unnamed Student";
-        if (typeof val === 'string') return val;
-        if (Array.isArray(val) && val.length > 0) return val[0].name || String(val[0]);
-        if (val.name) return val.name;
-        return String(val);
+    if (debugMode) {
+        output.text(`🔍 Rehearsal selected: ${rehearsalId}`);
+        output.text(`🔍 Attendance records found: ${attendanceQuery.records.length}`);
+        output.text(`🔍 Check-ins matching this rehearsal/date: ${checkinRecords.length}`);
+        output.text(`🔍 Check-in IDs: ${[...checkinIds].join(", ") || "none"}`);
+        output.text(`🔍 Check-in names: ${[...checkinNames].join(", ") || "none"}`);
     }
 
-    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    let isRunning = true;
-    let debugMode = true; // Set to false after debugging
-    
-    while (isRunning) {
-        let rosterQuery = await rostersTable.selectRecordsAsync({ fields: [rosterPrimaryField, "Ensemble Registered"] });
-        let groupStudents = rosterQuery.records.filter(student => {
-            let studentGroups = student.getCellValue("Ensemble Registered");
-            if (!studentGroups) return false;
-            if (Array.isArray(studentGroups)) {
-                return studentGroups.some(g => g && (g.name === targetGroupName || g === targetGroupName));
-            }
-            return studentGroups === targetGroupName || studentGroups.name === targetGroupName;
-        });
+    const absenceQuery = await absencesTable.selectRecordsAsync({
+        fields: ["Student Name", "Absence Date", "Absence Type", arrivalTimeField]
+    });
 
-        groupStudents.sort((a, b) => {
-            let nameA = getStudentName(a).toLowerCase();
-            let nameB = getStudentName(b).toLowerCase();
-            return nameA.localeCompare(nameB);
-        });
+    const absenceById = new Map();
+    const absenceByName = new Map();
 
-        let attendanceQuery = await attendanceTable.selectRecordsAsync({ fields: ["Student", "Rehearsal Date"] });
-        
-        if (debugMode) {
-            output.text(`🔍 DEBUG: Found ${attendanceQuery.records.length} total attendance records`);
-            output.text(`🔍 Looking for rehearsal ID: ${selectedRehearsalId}`);
+    for (const record of absenceQuery.records) {
+        const absenceDate = record.getCellValue("Absence Date");
+        const matches = recordHasLink(absenceDate, rehearsalId) || dateKey(absenceDate) === rehearsalDateKey;
+        if (!matches) continue;
+
+        const typeValue = record.getCellValue("Absence Type");
+        const type = typeof typeValue === "string" ? typeValue : linkedName(typeValue) || "Absence";
+        const absence = { type, time: formatTime(record.getCellValue(arrivalTimeField)) };
+
+        for (const student of linkedValues(record.getCellValue("Student Name"))) {
+            if (student?.id) absenceById.set(student.id, absence);
+            const name = linkedName(student);
+            if (name) absenceByName.set(name, absence);
         }
-        
-        let existingCheckins = attendanceQuery.records.filter(att => {
-            let rehearsalLink = att.getCellValue("Rehearsal Date");
-            if (debugMode && groupStudents[0] && att.id.substring(0, 5) === groupStudents[0].id.substring(0, 5)) {
-                output.text(`🔍 Record ${att.id}: rehearsalLink = ${JSON.stringify(rehearsalLink)}`);
+    }
+
+    const present = [];
+    const absent = [];
+    const tardy = [];
+    const early = [];
+    const missing = [];
+
+    for (const student of students) {
+        const name = getStudentName(student);
+        const nameKey = name.trim().toLowerCase();
+        const isCheckedIn = checkinIds.has(student.id) || checkinNames.has(nameKey);
+        const absence = absenceById.get(student.id) || absenceByName.get(nameKey);
+
+        if (isCheckedIn) {
+            present.push(name);
+        } else if (absence) {
+            switch (absence.type.trim()) {
+                case "Tardiness": tardy.push({ name, time: absence.time }); break;
+                case "Early Dismissal": early.push(name); break;
+                default: absent.push(name);
             }
-            return rehearsalLink && getLinkedRecordValues(rehearsalLink).some(r => r && r.id === selectedRehearsalId);
-        });
-
-        if (debugMode) {
-            output.text(`🔍 Filtered to ${existingCheckins.length} matching this rehearsal`);
-        }
-
-        let checkedInStudentIds = new Set();
-        let checkedInStudentNames = new Set();
-
-        existingCheckins.forEach(att => {
-            let studentLink = att.getCellValue("Student");
-            let linkedStudents = getLinkedRecordValues(studentLink);
-
-            linkedStudents.forEach(student => {
-                if (student && student.id) {
-                    checkedInStudentIds.add(student.id);
-                }
-                let studentName = getLinkedRecordName(student);
-                if (studentName) {
-                    checkedInStudentNames.add(studentName);
-                }
-                if (debugMode) {
-                    output.text(`✅ Checked in: ${student.name || student.id || student}`);
-                }
-            });
-        });
-
-        if (debugMode) {
-            output.text(`✅ Check-in IDs found: ${checkedInStudentIds.size}`);
-            output.text(`✅ Check-in names found: ${checkedInStudentNames.size}`);
-        }
-
-        let absenceQuery = await absencesTable.selectRecordsAsync({ fields: ["Student Name", "Absence Date", "Absence Type", arrivalTimeField] });
-        let relevantAbsences = absenceQuery.records.filter(abs => {
-            let rehearsalLink = abs.getCellValue("Absence Date");
-            return rehearsalLink && getLinkedRecordValues(rehearsalLink).some(r => r && r.id === selectedRehearsalId);
-        });
-
-        let studentAbsenceMapById = new Map();
-        let studentAbsenceMapByName = new Map();
-
-        relevantAbsences.forEach(abs => {
-            let studentLinks = abs.getCellValue("Student Name");
-            let absenceType = abs.getCellValue("Absence Type");
-            let rawTime = abs.getCellValue(arrivalTimeField);
-            
-            let typeString = "Absence";
-            if (absenceType) {
-                typeString = typeof absenceType === 'string' ? absenceType : (absenceType.name || String(absenceType));
-            }
-
-            let timeString = "";
-            if (rawTime) {
-                timeString = String(rawTime);
-                if (timeString.includes('T')) {
-                    let timePart = timeString.split('T')[1];
-                    if (timePart) {
-                        let parts = timePart.split(':');
-                        if (parts.length >= 2) {
-                            let hours = parseInt(parts[0], 10);
-                            let minutes = parts[1];
-                            let ampm = hours >= 12 ? 'PM' : 'AM';
-                            hours = hours % 12;
-                            hours = hours ? hours : 12;
-                            timeString = `${hours}:${minutes} ${ampm}`;
-                        }
-                    }
-                }
-            }
-
-            let absenceObj = { type: typeString, time: timeString };
-
-            if (studentLinks && Array.isArray(studentLinks)) {
-                studentLinks.forEach(sLink => {
-                    if (sLink && sLink.id) {
-                        studentAbsenceMapById.set(sLink.id, absenceObj);
-                    }
-                    let sName = getLinkedRecordName(sLink);
-                    if (sName) {
-                        studentAbsenceMapByName.set(sName, absenceObj);
-                    }
-                });
-            } else if (studentLinks && studentLinks.id) {
-                studentAbsenceMapById.set(studentLinks.id, absenceObj);
-                let sName = getLinkedRecordName(studentLinks);
-                if (sName) {
-                    studentAbsenceMapByName.set(sName, absenceObj);
-                }
-            }
-        });
-
-        let checkedInStudents = [];
-        let generalAbsence = []; 
-        let tardiness = []; 
-        let earlyDismissal = [];
-        let unexcusedMissingStudents = [];
-
-        groupStudents.forEach(student => {
-            let studentName = getStudentName(student);
-            let studentNameKey = studentName.trim().toLowerCase();
-            let isCheckedIn = checkedInStudentIds.has(student.id) || checkedInStudentNames.has(studentNameKey);
-            let absenceData = studentAbsenceMapById.get(student.id) || studentAbsenceMapByName.get(studentNameKey);
-
-            // Check in FIRST (highest priority)
-            if (isCheckedIn) {
-                checkedInStudents.push(studentName);
-            } else if (absenceData) {
-                // THEN check for absences
-                let typeClean = absenceData.type.trim();
-                switch (typeClean) {
-                    case "Tardiness":
-                        tardiness.push({ name: studentName, time: absenceData.time });
-                        break;
-                    case "Early Dismissal":
-                        earlyDismissal.push(studentName);
-                        break;
-                    case "Illness":
-                        generalAbsence.push(studentName);
-                        break;
-                    case "Absence":
-                        generalAbsence.push(studentName);
-                        break;
-                    case "Schedule conflict with a mandatory rehearsal":
-                        generalAbsence.push(studentName);
-                        break;
-                    default:
-                        generalAbsence.push(`${studentName} (Type: ${typeClean})`);
-                }
-            } else {
-                // No check-in, no absence form = missing
-                unexcusedMissingStudents.push(studentName);
-            }
-        });
-
-        output.clear();
-        output.markdown(`## 🟢 LIVE Attendance Report: ${targetGroupName}`);
-        if (TEST_DATE_OVERRIDE) {
-            output.text(`⚠️ [TEST MODE ACTIVE] Simulated Date: ${rehearsalDisplayDate} | Last Updated: ${new Date().toLocaleTimeString()}`);
         } else {
-            output.text(`Rehearsal Date: ${rehearsalDisplayDate} | Last Updated: ${new Date().toLocaleTimeString()}`);
+            missing.push(name);
         }
-        output.text(`--------------------------------------------------`);
-        output.text(`📊 Summary: ${checkedInStudents.length} Checked In | Forms: ${generalAbsence.length} Absent/Ill/Conflict, ${tardiness.length} Tardiness, ${earlyDismissal.length} Early Dismissal | Missing: ${unexcusedMissingStudents.length}`);
-        output.text(`--------------------------------------------------`);
-
-        output.markdown(`### Present (${checkedInStudents.length})`);
-        if (checkedInStudents.length === 0) output.text("None yet.");
-        else checkedInStudents.forEach(name => output.text(`• ${name}`));
-
-        output.markdown(`### Absent (${generalAbsence.length})`);
-        if (generalAbsence.length === 0) output.text("None.");
-        else generalAbsence.forEach(name => output.text(`• ${name}`));
-
-        output.markdown(`### Tardy (${tardiness.length})`);
-        if (tardiness.length === 0) output.text("None.");
-        else tardiness.forEach(item => output.text(item.time ? `• ${item.name} (Expected Arrival: ${item.time})` : `• ${item.name}`));
-
-        output.markdown(`### Leaving Early (${earlyDismissal.length})`);
-        if (earlyDismissal.length === 0) output.text("None.");
-        else earlyDismissal.forEach(name => output.text(`• ${name}`));
-
-        output.markdown(`### Missing (${unexcusedMissingStudents.length})`);
-        if (unexcusedMissingStudents.length === 0) output.text("All students accounted for!");
-        else unexcusedMissingStudents.forEach(name => output.text(`• ${name}`));
-
-        await sleep(REFRESH_INTERVAL_MS);
     }
+
+    output.clear();
+    output.markdown(`## 🟢 LIVE Attendance Report: ${selectedGroup}`);
+    output.text(`Rehearsal Date: ${rehearsalDateKey} | Last Updated: ${new Date().toLocaleTimeString()}`);
+    output.text(`📊 Summary: ${present.length} Checked In | ${absent.length} Absent | ${tardy.length} Tardy | ${early.length} Leaving Early | ${missing.length} Missing`);
+
+    output.markdown(`### Present (${present.length})`);
+    present.length ? present.forEach(name => output.text(`• ${name}`)) : output.text("None yet.");
+    output.markdown(`### Absent (${absent.length})`);
+    absent.length ? absent.forEach(name => output.text(`• ${name}`)) : output.text("None.");
+    output.markdown(`### Tardy (${tardy.length})`);
+    tardy.length ? tardy.forEach(item => output.text(item.time ? `• ${item.name} (Expected Arrival: ${item.time})` : `• ${item.name}`)) : output.text("None.");
+    output.markdown(`### Leaving Early (${early.length})`);
+    early.length ? early.forEach(name => output.text(`• ${name}`)) : output.text("None.");
+    output.markdown(`### Missing (${missing.length})`);
+    missing.length ? missing.forEach(name => output.text(`• ${name}`)) : output.text("All students accounted for!");
+
+    await sleep(REFRESH_INTERVAL_MS);
 }
