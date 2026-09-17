@@ -1,0 +1,217 @@
+// Airtable Script: Live attendance report
+const REFRESH_INTERVAL_MS = 60000;
+const TEST_DATE_OVERRIDE = null; // Example: "2026-09-16"
+
+const rostersTable = base.getTable("Ensemble Rosters");
+const rehearsalsTable = base.getTable("Rehearsals/Concerts");
+const attendanceTable = base.getTable("Attendance");
+const absencesTable = base.getTable("Absence Requests");
+
+const rosterPrimaryField = "Student";
+const arrivalTimeField = "Tardy Arrival Time";
+const attendanceDateField = "Date of Attendance";
+const attendanceStudentField = "Student";
+const attendanceEnsembleField = "Ensemble";
+
+function dateKey(value) {
+    if (!value) return null;
+    if (value instanceof Date) {
+        return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+    }
+    const match = String(value).match(/(\d{4})-(\d{2})-(\d{2})/);
+    return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
+}
+
+function linkedValues(value) {
+    if (!value) return [];
+    return Array.isArray(value) ? value : [value];
+}
+
+function linkedName(value) {
+    if (!value) return "";
+    if (typeof value === "string") return value.trim().toLowerCase();
+    return String(value.name || value.value || "").trim().toLowerCase();
+}
+
+function linkedIds(value) {
+    return linkedValues(value).filter(Boolean).map(item => item.id).filter(Boolean);
+}
+
+function getStudentName(record) {
+    const value = record.getCellValue(rosterPrimaryField);
+    if (!value) return "Unnamed Student";
+    if (typeof value === "string") return value.trim();
+    if (Array.isArray(value)) return (value[0]?.name || String(value[0])).trim();
+    return String(value.name || value).trim();
+}
+
+function formatTime(value) {
+    if (!value) return "";
+    const match = String(value).match(/T(\d{2}):(\d{2})/);
+    if (!match) return String(value);
+    let hour = parseInt(match[1], 10);
+    const ampm = hour >= 12 ? "PM" : "AM";
+    hour = hour % 12 || 12;
+    return `${hour}:${match[2]} ${ampm}`;
+}
+
+function absenceMatchesRehearsal(absenceRecord, rehearsalId, rehearsalDateKey) {
+    const value = absenceRecord.getCellValue("Absence Date");
+    return linkedIds(value).includes(rehearsalId) || dateKey(value) === rehearsalDateKey;
+}
+
+const targetDateKey = TEST_DATE_OVERRIDE || dateKey(new Date());
+
+const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
+    fields: ["Rehearsal Date", "Ensemble(s)"]
+});
+
+const targetRehearsals = rehearsalQuery.records.filter(record =>
+    dateKey(record.getCellValue("Rehearsal Date")) === targetDateKey
+);
+
+const ensembleOptions = [];
+const seenEnsembleIds = new Set();
+
+for (const rehearsal of targetRehearsals) {
+    for (const ensemble of linkedValues(rehearsal.getCellValue("Ensemble(s)"))) {
+        if (ensemble?.id && !seenEnsembleIds.has(ensemble.id)) {
+            seenEnsembleIds.add(ensemble.id);
+            ensembleOptions.push({ id: ensemble.id, name: ensemble.name });
+        }
+    }
+}
+
+if (ensembleOptions.length === 0) {
+    output.text(`❌ No ensembles found with a rehearsal scheduled for ${targetDateKey}.`);
+} else {
+    const selectedEnsembleName = await input.buttonsAsync(
+        TEST_DATE_OVERRIDE
+            ? `🧪 TEST MODE (${TEST_DATE_OVERRIDE}) — Select ensemble:`
+            : "Select today's ensemble:",
+        ensembleOptions.map(option => option.name)
+    );
+
+    const selectedEnsemble = ensembleOptions.find(option => option.name === selectedEnsembleName);
+    const selectedRehearsal = targetRehearsals.find(rehearsal =>
+        linkedIds(rehearsal.getCellValue("Ensemble(s)"))
+            .includes(selectedEnsemble.id)
+    );
+
+    if (!selectedRehearsal) {
+        output.text(`❌ Could not find the rehearsal for ${selectedEnsembleName} on ${targetDateKey}.`);
+    } else {
+        const selectedRehearsalId = selectedRehearsal.id;
+        const selectedRehearsalDateKey = dateKey(selectedRehearsal.getCellValue("Rehearsal Date"));
+        const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+        while (true) {
+            const rosterQuery = await rostersTable.selectRecordsAsync({
+                fields: [rosterPrimaryField, "Ensemble Registered"]
+            });
+
+            const groupStudents = rosterQuery.records
+                .filter(student => linkedValues(student.getCellValue("Ensemble Registered"))
+                    .some(group => linkedName(group) === selectedEnsembleName.trim().toLowerCase()))
+                .sort((a, b) => getStudentName(a).localeCompare(getStudentName(b)));
+
+            // IMPORTANT: Attendance uses Date and Ensemble.
+            // Attendance → Rehearsal Date is blank and must not be used.
+            const attendanceQuery = await attendanceTable.selectRecordsAsync({
+                fields: [attendanceDateField, attendanceStudentField, attendanceEnsembleField]
+            });
+
+            const checkinRecords = attendanceQuery.records.filter(attendance => {
+                const attendanceDate = dateKey(attendance.getCellValue(attendanceDateField));
+                const attendanceEnsembleIds = linkedIds(attendance.getCellValue(attendanceEnsembleField));
+                return attendanceDate === selectedRehearsalDateKey &&
+                    attendanceEnsembleIds.includes(selectedEnsemble.id);
+            });
+
+            const checkedInIds = new Set();
+            const checkedInNames = new Set();
+
+            for (const attendance of checkinRecords) {
+                for (const student of linkedValues(attendance.getCellValue(attendanceStudentField))) {
+                    if (student?.id) checkedInIds.add(student.id);
+                    const name = linkedName(student);
+                    if (name) checkedInNames.add(name);
+                }
+            }
+
+            const absenceQuery = await absencesTable.selectRecordsAsync({
+                fields: ["Student Name", "Absence Date", "Absence Type", arrivalTimeField]
+            });
+
+            const absencesById = new Map();
+            const absencesByName = new Map();
+
+            for (const absence of absenceQuery.records) {
+                if (!absenceMatchesRehearsal(absence, selectedRehearsalId, selectedRehearsalDateKey)) continue;
+
+                const typeValue = absence.getCellValue("Absence Type");
+                const type = typeof typeValue === "string"
+                    ? typeValue.trim()
+                    : linkedName(typeValue) || "Absence";
+                const data = {
+                    type,
+                    time: formatTime(absence.getCellValue(arrivalTimeField))
+                };
+
+                for (const student of linkedValues(absence.getCellValue("Student Name"))) {
+                    if (student?.id) absencesById.set(student.id, data);
+                    const name = linkedName(student);
+                    if (name) absencesByName.set(name, data);
+                }
+            }
+
+            const present = [];
+            const absent = [];
+            const tardy = [];
+            const early = [];
+            const missing = [];
+
+            for (const student of groupStudents) {
+                const name = getStudentName(student);
+                const nameKey = name.toLowerCase();
+                const isCheckedIn = checkedInIds.has(student.id) || checkedInNames.has(nameKey);
+                const absence = absencesById.get(student.id) || absencesByName.get(nameKey);
+
+                if (isCheckedIn) {
+                    present.push(name);
+                } else if (absence) {
+                    switch (absence.type) {
+                        case "Tardiness":
+                            tardy.push({ name, time: absence.time });
+                            break;
+                        case "Early Dismissal":
+                            early.push(name);
+                            break;
+                        default:
+                            absent.push(name);
+                    }
+                } else {
+                    missing.push(name);
+                }
+            }
+
+            output.clear();
+            output.markdown(`## 🟢 LIVE Attendance Report: ${selectedEnsembleName}`);
+            output.text(`Rehearsal Date: ${selectedRehearsalDateKey} | Last Updated: ${new Date().toLocaleTimeString()}`);
+            output.text(`📊 ${present.length} Checked In | ${absent.length} Absent | ${tardy.length} Tardy | ${early.length} Leaving Early | ${missing.length} Missing`);
+
+            output.markdown(`### Present (${present.length})`);
+            present.length ? present.forEach(name => output.text(`• ${name}`)) : output.text("None yet.");
+            output.markdown(`### Absent (${absent.length})`);
+            absent.length ? absent.forEach(name => output.text(`• ${name}`)) : output.text("None.");
+            output.markdown(`### Tardy (${tardy.length})`);
+            tardy.length ? tardy.forEach(item => output.text(item.time ? `• ${item.name} (Expected Arrival: ${item.time})` : `• ${item.name}`)) : output.text("None.");
+            output.markdown(`### Leaving Early (${early.length})`);
+            early.length ? early.forEach(name => output.text(`• ${name}`)) : output.text("None.");
+            output.markdown(`### Missing (${missing.length})`);
+            missing.length ? missing.forEach(name => output.text(`• ${name}`)) : output.text("All students accounted for!");
+
+            await sleep(REFRESH_INTERVAL_MS);
+        }
+    }
+}
