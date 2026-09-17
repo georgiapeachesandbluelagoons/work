@@ -1,4 +1,4 @@
-// Airtable Script: Attendance matrix matching the spreadsheet screenshot
+// Airtable Script: Attendance matrix with student rows and rehearsal-date columns
 const rostersTable = base.getTable("Ensemble Rosters");
 const rehearsalsTable = base.getTable("Rehearsals/Concerts");
 const attendanceTable = base.getTable("Attendance");
@@ -37,10 +37,9 @@ function dateKey(value) {
     return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
 }
 
-function displayDate(dateKeyValue) {
-    if (!dateKeyValue) return "";
-    const [year, month, day] = dateKeyValue.split("-").map(Number);
-    return new Date(year, month - 1, day).toLocaleDateString("en-US");
+function displayDate(key) {
+    const [year, month, day] = key.split("-").map(Number);
+    return `${month}/${day}/${year}`;
 }
 
 function getStudentName(record) {
@@ -51,16 +50,6 @@ function getStudentName(record) {
     return String(value.name || value).trim();
 }
 
-function formatTime(value) {
-    if (!value) return "";
-    const match = String(value).match(/T(\d{2}):(\d{2})/);
-    if (!match) return String(value);
-    let hour = parseInt(match[1], 10);
-    const ampm = hour >= 12 ? "PM" : "AM";
-    hour = hour % 12 || 12;
-    return `${hour}:${match[2]} ${ampm}`;
-}
-
 function normalizeAbsenceType(value) {
     if (!value) return "Absent";
     const text = typeof value === "string"
@@ -68,20 +57,15 @@ function normalizeAbsenceType(value) {
         : String(value.name || value.value || "").trim();
     const lower = text.toLowerCase();
 
+    if (lower.includes("excus")) return "Excused";
     if (lower.includes("tardy") || lower.includes("late")) return "Tardy";
     if (lower.includes("early") || lower.includes("dismiss")) return "Leaving Early";
-    if (lower.includes("excus")) return "Excused";
     return "Absent";
 }
 
-function absenceMatchesRehearsal(record, rehearsalId, rehearsalDateKey) {
+function absenceMatchesDate(record, rehearsalId, rehearsalDate) {
     const value = record.getCellValue(absenceDateField);
-    if (!value) return false;
-
-    const ids = linkedIds(value);
-    if (ids.includes(rehearsalId)) return true;
-
-    return dateKey(value) === rehearsalDateKey;
+    return linkedIds(value).includes(rehearsalId) || dateKey(value) === rehearsalDate;
 }
 
 const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
@@ -110,9 +94,7 @@ if (ensembleOptions.length === 0) {
         ensembleOptions.map(option => option.name)
     );
 
-    const selectedEnsemble = ensembleOptions.find(
-        option => option.name === selectedEnsembleName
-    );
+    const selectedEnsemble = ensembleOptions.find(option => option.name === selectedEnsembleName);
 
     if (!selectedEnsemble) {
         output.text("❌ No ensemble was selected.");
@@ -135,83 +117,57 @@ if (ensembleOptions.length === 0) {
                 fields: [rosterPrimaryField, "Ensemble Registered"]
             });
 
-            const groupStudents = rosterQuery.records
+            const students = rosterQuery.records
                 .filter(student => linkedValues(student.getCellValue("Ensemble Registered"))
                     .some(group => linkedName(group) === selectedEnsembleName.trim().toLowerCase()))
                 .sort((a, b) => getStudentName(a).localeCompare(getStudentName(b)));
 
-            const attendanceByStudentDate = new Map();
+            const statusByStudentDate = new Map();
+
             const attendanceQuery = await attendanceTable.selectRecordsAsync({
                 fields: [attendanceDateField, attendanceStudentField, attendanceEnsembleField]
             });
 
             for (const attendance of attendanceQuery.records) {
-                const attendanceDate = dateKey(attendance.getCellValue(attendanceDateField));
-                const ensembleIds = linkedIds(attendance.getCellValue(attendanceEnsembleField));
-
-                if (!attendanceDate || !dateOptions.includes(attendanceDate)) continue;
-                if (!ensembleIds.includes(selectedEnsemble.id)) continue;
+                const date = dateKey(attendance.getCellValue(attendanceDateField));
+                if (!date || !dateOptions.includes(date)) continue;
+                if (!linkedIds(attendance.getCellValue(attendanceEnsembleField)).includes(selectedEnsemble.id)) continue;
 
                 for (const student of linkedValues(attendance.getCellValue(attendanceStudentField))) {
                     if (student?.id) {
-                        attendanceByStudentDate.set(`${student.id}|${attendanceDate}`, "Present");
+                        statusByStudentDate.set(`${student.id}|${date}`, "Present");
                     }
                 }
             }
 
-            const absenceByStudentDate = new Map();
             const absenceQuery = await absencesTable.selectRecordsAsync({
                 fields: [absenceStudentField, absenceDateField, absenceTypeField, tardyArrivalField]
             });
 
             for (const absence of absenceQuery.records) {
+                const type = normalizeAbsenceType(absence.getCellValue(absenceTypeField));
+
                 for (const rehearsal of ensembleRehearsals) {
-                    const rehearsalDate = dateKey(rehearsal.getCellValue("Rehearsal Date"));
-                    if (!rehearsalDate || !dateOptions.includes(rehearsalDate)) continue;
-
-                    if (!absenceMatchesRehearsal(absence, rehearsal.id, rehearsalDate)) continue;
-
-                    const normalizedType = normalizeAbsenceType(absence.getCellValue(absenceTypeField));
-                    const arrivalTime = formatTime(absence.getCellValue(tardyArrivalField));
+                    const date = dateKey(rehearsal.getCellValue("Rehearsal Date"));
+                    if (!date || !dateOptions.includes(date)) continue;
+                    if (!absenceMatchesDate(absence, rehearsal.id, date)) continue;
 
                     for (const student of linkedValues(absence.getCellValue(absenceStudentField))) {
                         if (!student?.id) continue;
-                        const key = `${student.id}|${rehearsalDate}`;
-
-                        if (normalizedType === "Tardy") {
-                            absenceByStudentDate.set(key, { status: "Tardy", time: arrivalTime });
-                        } else if (normalizedType === "Leaving Early") {
-                            absenceByStudentDate.set(key, { status: "Leaving Early", time: "" });
-                        } else if (normalizedType === "Excused") {
-                            absenceByStudentDate.set(key, { status: "Excused", time: "" });
-                        } else {
-                            absenceByStudentDate.set(key, { status: "Absent", time: "" });
-                        }
+                        if (statusByStudentDate.has(`${student.id}|${date}`)) continue;
+                        statusByStudentDate.set(`${student.id}|${date}`, type);
                     }
                 }
             }
 
-            const rows = [];
-
-            for (const student of groupStudents) {
+            const rows = students.map(student => {
                 const row = { "Student Name": getStudentName(student) };
-
                 for (const date of dateOptions) {
-                    const key = `${student.id}|${date}`;
-                    const checkedIn = attendanceByStudentDate.get(key);
-                    const absence = absenceByStudentDate.get(key);
-
-                    if (checkedIn) {
-                        row[displayDate(date)] = "Present";
-                    } else if (absence) {
-                        row[displayDate(date)] = absence.status;
-                    } else {
-                        row[displayDate(date)] = "Missing";
-                    }
+                    const value = statusByStudentDate.get(`${student.id}|${date}`) || "Missing";
+                    row[displayDate(date)] = value;
                 }
-
-                rows.push(row);
-            }
+                return row;
+            });
 
             output.text(`## ${selectedEnsembleName}`);
             output.table(rows);
