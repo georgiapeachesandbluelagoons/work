@@ -1,11 +1,11 @@
-// Airtable Script: Attendance matrix matching the reference spreadsheet layout
+// Airtable Script: Attendance matrix with direct student/date matching
 const rostersTable = base.getTable("Ensemble Rosters");
 const rehearsalsTable = base.getTable("Rehearsals/Concerts");
 const attendanceTable = base.getTable("Attendance");
 const absencesTable = base.getTable("Absence Requests");
 
 const rosterPrimaryField = "Student";
-const attendanceDateField = "Date of Attendance"; // Linked record to Rehearsals/Concerts
+const attendanceDateField = "Date of Attendance";
 const attendanceStudentField = "Student";
 const attendanceEnsembleField = "Ensemble";
 const absenceDateField = "Absence Date";
@@ -34,11 +34,15 @@ function dateKey(value) {
         return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
     }
     const match = String(value).match(/(\d{4})-(\d{2})-(\d{2})/);
-    return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
+    if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+
+    const usMatch = String(value).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    return usMatch
+        ? `${usMatch[3]}-${String(usMatch[1]).padStart(2, "0")}-${String(usMatch[2]).padStart(2, "0")}`
+        : null;
 }
 
 function displayDate(key) {
-    if (!key) return "";
     const [year, month, day] = key.split("-").map(Number);
     return `${month}/${day}/${year}`;
 }
@@ -51,11 +55,16 @@ function getStudentName(record) {
     return String(value.name || value).trim();
 }
 
+function getRosterStudentIds(record) {
+    return linkedIds(record.getCellValue(rosterPrimaryField));
+}
+
 function normalizeAbsenceType(value) {
     if (!value) return "Absent";
-    const text = typeof value === "string" ? value.trim() : String(value.name || value.value || "").trim();
+    const text = typeof value === "string"
+        ? value.trim()
+        : String(value.name || value.value || "").trim();
     const lower = text.toLowerCase();
-
     if (lower.includes("excus")) return "Excused";
     if (lower.includes("tardy") || lower.includes("late")) return "Tardy";
     if (lower.includes("early") || lower.includes("dismiss")) return "Leaving Early";
@@ -64,7 +73,6 @@ function normalizeAbsenceType(value) {
 
 function absenceMatchesDate(record, rehearsalId, rehearsalDate) {
     const value = record.getCellValue(absenceDateField);
-    if (!value) return false;
     return linkedIds(value).includes(rehearsalId) || dateKey(value) === rehearsalDate;
 }
 
@@ -72,18 +80,13 @@ const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
     fields: ["Rehearsal Date", "Ensemble(s)"]
 });
 
-// Keep the rehearsal record itself so attendance can be matched by linked record ID.
 const rehearsalInfoById = new Map();
 const ensembleOptions = [];
 const seenEnsembleIds = new Set();
 
 for (const rehearsal of rehearsalQuery.records) {
-    const rehearsalDate = dateKey(rehearsal.getCellValue("Rehearsal Date"));
-    rehearsalInfoById.set(rehearsal.id, {
-        id: rehearsal.id,
-        date: rehearsalDate,
-        ensembleIds: linkedIds(rehearsal.getCellValue("Ensemble(s)"))
-    });
+    const date = dateKey(rehearsal.getCellValue("Rehearsal Date"));
+    rehearsalInfoById.set(rehearsal.id, { id: rehearsal.id, date });
 
     for (const ensemble of linkedValues(rehearsal.getCellValue("Ensemble(s)"))) {
         if (ensemble?.id && ensemble.name && !seenEnsembleIds.has(ensemble.id)) {
@@ -102,7 +105,6 @@ if (ensembleOptions.length === 0) {
         "Select the ensemble:",
         ensembleOptions.map(option => option.name)
     );
-
     const selectedEnsemble = ensembleOptions.find(option => option.name === selectedEnsembleName);
 
     if (!selectedEnsemble) {
@@ -112,12 +114,9 @@ if (ensembleOptions.length === 0) {
             linkedIds(rehearsal.getCellValue("Ensemble(s)"))
                 .includes(selectedEnsemble.id)
         );
-
-        const selectedRehearsalIds = new Set(ensembleRehearsals.map(rehearsal => rehearsal.id));
+        const selectedRehearsalIds = new Set(ensembleRehearsals.map(record => record.id));
         const dateOptions = [...new Set(
-            ensembleRehearsals
-                .map(rehearsal => dateKey(rehearsal.getCellValue("Rehearsal Date")))
-                .filter(Boolean)
+            ensembleRehearsals.map(record => dateKey(record.getCellValue("Rehearsal Date"))).filter(Boolean)
         )].sort((a, b) => a.localeCompare(b));
 
         if (dateOptions.length === 0) {
@@ -126,43 +125,34 @@ if (ensembleOptions.length === 0) {
             const rosterQuery = await rostersTable.selectRecordsAsync({
                 fields: [rosterPrimaryField, "Ensemble Registered"]
             });
-
             const students = rosterQuery.records
-                .filter(student => linkedValues(student.getCellValue("Ensemble Registered"))
+                .filter(record => linkedValues(record.getCellValue("Ensemble Registered"))
                     .some(group => linkedName(group) === selectedEnsembleName.trim().toLowerCase()))
                 .sort((a, b) => getStudentName(a).localeCompare(getStudentName(b)));
 
             const statusByStudentDate = new Map();
+            const setStatus = (studentId, studentName, date, status) => {
+                if (studentId) statusByStudentDate.set(`${studentId}|${date}`, status);
+                if (studentName) statusByStudentDate.set(`${studentName}|${date}`, status);
+            };
 
             const attendanceQuery = await attendanceTable.selectRecordsAsync({
                 fields: [attendanceDateField, attendanceStudentField, attendanceEnsembleField]
             });
 
             for (const attendance of attendanceQuery.records) {
-                // Date of Attendance is now a linked record to Rehearsals/Concerts.
-                // Use that linked record's ID to get the exact rehearsal date.
-                const linkedRehearsalIds = linkedIds(attendance.getCellValue(attendanceDateField));
-                const matchingRehearsals = linkedRehearsalIds
+                const attendanceDateLinks = linkedIds(attendance.getCellValue(attendanceDateField));
+                const matchedDates = attendanceDateLinks
                     .filter(id => selectedRehearsalIds.has(id))
-                    .map(id => rehearsalInfoById.get(id))
-                    .filter(info => info?.date && dateOptions.includes(info.date));
+                    .map(id => rehearsalInfoById.get(id)?.date)
+                    .filter(date => dateOptions.includes(date));
 
-                // Backward-compatible fallback if the field is still a date field.
-                if (matchingRehearsals.length === 0) {
-                    const legacyDate = dateKey(attendance.getCellValue(attendanceDateField));
-                    if (legacyDate && dateOptions.includes(legacyDate) &&
-                        linkedIds(attendance.getCellValue(attendanceEnsembleField)).includes(selectedEnsemble.id)) {
-                        matchingRehearsals.push({ date: legacyDate });
-                    }
-                }
-
-                if (matchingRehearsals.length === 0) continue;
+                if (matchedDates.length === 0) continue;
 
                 for (const student of linkedValues(attendance.getCellValue(attendanceStudentField))) {
-                    if (!student?.id) continue;
-                    for (const rehearsal of matchingRehearsals) {
-                        statusByStudentDate.set(`${student.id}|${rehearsal.date}`, "Present");
-                    }
+                    const id = student?.id;
+                    const name = linkedName(student);
+                    for (const date of matchedDates) setStatus(id, name, date, "Present");
                 }
             }
 
@@ -171,35 +161,40 @@ if (ensembleOptions.length === 0) {
             });
 
             for (const absence of absenceQuery.records) {
-                const type = normalizeAbsenceType(absence.getCellValue(absenceTypeField));
-
+                const status = normalizeAbsenceType(absence.getCellValue(absenceTypeField));
                 for (const rehearsal of ensembleRehearsals) {
                     const date = dateKey(rehearsal.getCellValue("Rehearsal Date"));
-                    if (!date || !dateOptions.includes(date)) continue;
-                    if (!absenceMatchesDate(absence, rehearsal.id, date)) continue;
+                    if (!date || !absenceMatchesDate(absence, rehearsal.id, date)) continue;
 
                     for (const student of linkedValues(absence.getCellValue(absenceStudentField))) {
-                        if (!student?.id) continue;
-                        const key = `${student.id}|${date}`;
-                        if (statusByStudentDate.has(key)) continue;
-                        statusByStudentDate.set(key, type);
+                        const id = student?.id;
+                        const name = linkedName(student);
+                        if (id || name) setStatus(id, name, date, status);
                     }
                 }
             }
 
-            const rowData = students.map(student => {
-                const row = { "Student Name": getStudentName(student) };
+            const rows = students.map(student => {
+                const name = getStudentName(student);
+                const nameKey = name.toLowerCase();
+                const studentIds = getRosterStudentIds(student);
+                const row = { "Student Name": name };
 
                 for (const date of dateOptions) {
-                    // Blank means no attendance or absence record has been entered yet.
-                    row[displayDate(date)] = statusByStudentDate.get(`${student.id}|${date}`) || "";
+                    let status = statusByStudentDate.get(`${nameKey}|${date}`);
+                    if (!status) {
+                        for (const studentId of studentIds) {
+                            status = statusByStudentDate.get(`${studentId}|${date}`);
+                            if (status) break;
+                        }
+                    }
+                    row[displayDate(date)] = status || "";
                 }
-
                 return row;
             });
 
             output.text(`## ${selectedEnsembleName}`);
-            output.table(rowData);
+            output.table(rows);
         }
     }
 }
