@@ -5,7 +5,7 @@ const attendanceTable = base.getTable("Attendance");
 const absencesTable = base.getTable("Absence Requests");
 
 const rosterPrimaryField = "Student";
-const attendanceDateField = "Date of Attendance";
+const attendanceDateField = "Date of Attendance"; // Linked record to Rehearsals/Concerts
 const attendanceStudentField = "Student";
 const attendanceEnsembleField = "Ensemble";
 const absenceDateField = "Absence Date";
@@ -72,10 +72,19 @@ const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
     fields: ["Rehearsal Date", "Ensemble(s)"]
 });
 
+// Keep the rehearsal record itself so attendance can be matched by linked record ID.
+const rehearsalInfoById = new Map();
 const ensembleOptions = [];
 const seenEnsembleIds = new Set();
 
 for (const rehearsal of rehearsalQuery.records) {
+    const rehearsalDate = dateKey(rehearsal.getCellValue("Rehearsal Date"));
+    rehearsalInfoById.set(rehearsal.id, {
+        id: rehearsal.id,
+        date: rehearsalDate,
+        ensembleIds: linkedIds(rehearsal.getCellValue("Ensemble(s)"))
+    });
+
     for (const ensemble of linkedValues(rehearsal.getCellValue("Ensemble(s)"))) {
         if (ensemble?.id && ensemble.name && !seenEnsembleIds.has(ensemble.id)) {
             seenEnsembleIds.add(ensemble.id);
@@ -104,6 +113,7 @@ if (ensembleOptions.length === 0) {
                 .includes(selectedEnsemble.id)
         );
 
+        const selectedRehearsalIds = new Set(ensembleRehearsals.map(rehearsal => rehearsal.id));
         const dateOptions = [...new Set(
             ensembleRehearsals
                 .map(rehearsal => dateKey(rehearsal.getCellValue("Rehearsal Date")))
@@ -129,13 +139,29 @@ if (ensembleOptions.length === 0) {
             });
 
             for (const attendance of attendanceQuery.records) {
-                const date = dateKey(attendance.getCellValue(attendanceDateField));
-                if (!date || !dateOptions.includes(date)) continue;
-                if (!linkedIds(attendance.getCellValue(attendanceEnsembleField)).includes(selectedEnsemble.id)) continue;
+                // Date of Attendance is now a linked record to Rehearsals/Concerts.
+                // Use that linked record's ID to get the exact rehearsal date.
+                const linkedRehearsalIds = linkedIds(attendance.getCellValue(attendanceDateField));
+                const matchingRehearsals = linkedRehearsalIds
+                    .filter(id => selectedRehearsalIds.has(id))
+                    .map(id => rehearsalInfoById.get(id))
+                    .filter(info => info?.date && dateOptions.includes(info.date));
+
+                // Backward-compatible fallback if the field is still a date field.
+                if (matchingRehearsals.length === 0) {
+                    const legacyDate = dateKey(attendance.getCellValue(attendanceDateField));
+                    if (legacyDate && dateOptions.includes(legacyDate) &&
+                        linkedIds(attendance.getCellValue(attendanceEnsembleField)).includes(selectedEnsemble.id)) {
+                        matchingRehearsals.push({ date: legacyDate });
+                    }
+                }
+
+                if (matchingRehearsals.length === 0) continue;
 
                 for (const student of linkedValues(attendance.getCellValue(attendanceStudentField))) {
-                    if (student?.id) {
-                        statusByStudentDate.set(`${student.id}|${date}`, "Present");
+                    if (!student?.id) continue;
+                    for (const rehearsal of matchingRehearsals) {
+                        statusByStudentDate.set(`${student.id}|${rehearsal.date}`, "Present");
                     }
                 }
             }
@@ -154,23 +180,23 @@ if (ensembleOptions.length === 0) {
 
                     for (const student of linkedValues(absence.getCellValue(absenceStudentField))) {
                         if (!student?.id) continue;
-                        if (statusByStudentDate.has(`${student.id}|${date}`)) continue;
-                        statusByStudentDate.set(`${student.id}|${date}`, type);
+                        const key = `${student.id}|${date}`;
+                        if (statusByStudentDate.has(key)) continue;
+                        statusByStudentDate.set(key, type);
                     }
                 }
             }
 
-            const rowData = [];
-            for (const student of students) {
+            const rowData = students.map(student => {
                 const row = { "Student Name": getStudentName(student) };
 
                 for (const date of dateOptions) {
-                    const value = statusByStudentDate.get(`${student.id}|${date}`);
-                    row[displayDate(date)] = value || "";
+                    // Blank means no attendance or absence record has been entered yet.
+                    row[displayDate(date)] = statusByStudentDate.get(`${student.id}|${date}`) || "";
                 }
 
-                rowData.push(row);
-            }
+                return row;
+            });
 
             output.text(`## ${selectedEnsembleName}`);
             output.table(rowData);
