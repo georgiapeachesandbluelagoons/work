@@ -1,39 +1,43 @@
-// Airtable Script: Attendance matrix with robust linked-student matching
+// Airtable Script: Attendance matrix keyed by exact rehearsal record and robust student aliases
 const rostersTable = base.getTable("Ensemble Rosters");
 const rehearsalsTable = base.getTable("Rehearsals/Concerts");
 const attendanceTable = base.getTable("Attendance");
 const absencesTable = base.getTable("Absence Requests");
 
 const rosterPrimaryField = "Student";
-const attendanceDateField = "Date of Attendance";
+const attendanceDateField = "Date of Attendance"; // Link to Rehearsals/Concerts
 const attendanceStudentField = "Student";
-const attendanceEnsembleField = "Ensemble";
-const absenceDateField = "Absence Date";
+const absenceDateField = "Absence Date"; // Link to Rehearsals/Concerts
 const absenceStudentField = "Student Name";
 const absenceTypeField = "Absence Type";
-const tardyArrivalField = "Tardy Arrival Time";
 
-function linkedValues(value) {
+function values(value) {
     if (!value) return [];
     return Array.isArray(value) ? value : [value];
 }
 
-function valueText(value) {
+function text(value) {
     if (value == null) return "";
     if (typeof value === "string" || typeof value === "number") return String(value).trim();
     return String(value.name || value.value || value.text || "").trim();
 }
 
-function normalizedName(value) {
-    return valueText(value).toLowerCase().replace(/\s+/g, " ");
+function nameKey(value) {
+    return text(value).toLowerCase().replace(/\s+/g, " ");
 }
 
-function linkedIds(value) {
-    return linkedValues(value).map(item => item?.id).filter(Boolean);
+function ids(value) {
+    return values(value).map(value => value?.id).filter(Boolean);
 }
 
-function linkedNames(value) {
-    return linkedValues(value).map(normalizedName).filter(Boolean);
+function aliasKeys(value) {
+    const result = [];
+    for (const item of values(value)) {
+        if (item?.id) result.push(`id:${item.id}`);
+        const name = nameKey(item);
+        if (name) result.push(`name:${name}`);
+    }
+    return result;
 }
 
 function dateKey(value) {
@@ -41,17 +45,11 @@ function dateKey(value) {
     if (value instanceof Date) {
         return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
     }
-
-    const text = String(value);
-    const isoMatch = text.match(/(\d{4})-(\d{2})-(\d{2})/);
-    if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
-
-    const usMatch = text.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-    if (usMatch) {
-        return `${usMatch[3]}-${String(usMatch[1]).padStart(2, "0")}-${String(usMatch[2]).padStart(2, "0")}`;
-    }
-
-    return null;
+    const valueText = String(value);
+    const iso = valueText.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+    const us = valueText.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    return us ? `${us[3]}-${String(us[1]).padStart(2, "0")}-${String(us[2]).padStart(2, "0")}` : null;
 }
 
 function displayDate(key) {
@@ -59,168 +57,133 @@ function displayDate(key) {
     return `${month}/${day}/${year}`;
 }
 
-function getStudentName(record) {
-    const value = record.getCellValue(rosterPrimaryField);
-    const firstValue = linkedValues(value)[0];
-    return valueText(firstValue) || record.name || "Unnamed Student";
+function studentName(record) {
+    const linkedStudent = values(record.getCellValue(rosterPrimaryField))[0];
+    return text(linkedStudent) || record.name || "Unnamed Student";
 }
 
-// Creates every identifier that could represent the same student. This supports:
-// - Attendance.Student linking directly to the roster record
-// - Attendance.Student linking to the underlying student record
-// - lookup/text-style student values containing only a name
-function studentAliases(record, fieldName) {
-    const aliases = new Set();
-    if (record?.id) aliases.add(`id:${record.id}`);
-
-    for (const value of linkedValues(record?.getCellValue(fieldName))) {
-        if (value?.id) aliases.add(`id:${value.id}`);
-        const name = normalizedName(value);
-        if (name) aliases.add(`name:${name}`);
-    }
-
-    const recordName = normalizedName(record?.name);
-    if (recordName) aliases.add(`name:${recordName}`);
-    return aliases;
+function rosterAliases(record) {
+    const result = new Set();
+    if (record.id) result.add(`id:${record.id}`);
+    for (const key of aliasKeys(record.getCellValue(rosterPrimaryField))) result.add(key);
+    if (record.name) result.add(`name:${nameKey(record.name)}`);
+    return result;
 }
 
-function aliasKeysFromValue(value) {
-    const keys = [];
-    for (const item of linkedValues(value)) {
-        if (item?.id) keys.push(`id:${item.id}`);
-        const name = normalizedName(item);
-        if (name) keys.push(`name:${name}`);
-    }
-    return keys;
-}
-
-function normalizeAbsenceType(value) {
-    const text = valueText(value).toLowerCase();
-    if (text.includes("excus")) return "Excused";
-    if (text.includes("tardy") || text.includes("late")) return "Tardy";
-    if (text.includes("early") || text.includes("dismiss")) return "Leaving Early";
+function absenceStatus(value) {
+    const lower = text(value).toLowerCase();
+    if (lower.includes("excus")) return "Excused";
+    if (lower.includes("tardy") || lower.includes("late")) return "Tardy";
+    if (lower.includes("early") || lower.includes("dismiss")) return "Leaving Early";
     return "Absent";
-}
-
-function absenceMatchesDate(record, rehearsalId, rehearsalDate) {
-    const value = record.getCellValue(absenceDateField);
-    return linkedIds(value).includes(rehearsalId) || dateKey(value) === rehearsalDate;
 }
 
 const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
     fields: ["Rehearsal Date", "Ensemble(s)"]
 });
 
-const rehearsalInfoById = new Map();
-const ensembleOptions = [];
+const ensembles = [];
 const seenEnsembleIds = new Set();
-
 for (const rehearsal of rehearsalQuery.records) {
-    const date = dateKey(rehearsal.getCellValue("Rehearsal Date"));
-    rehearsalInfoById.set(rehearsal.id, { date });
-
-    for (const ensemble of linkedValues(rehearsal.getCellValue("Ensemble(s)"))) {
+    for (const ensemble of values(rehearsal.getCellValue("Ensemble(s)"))) {
         if (ensemble?.id && ensemble.name && !seenEnsembleIds.has(ensemble.id)) {
             seenEnsembleIds.add(ensemble.id);
-            ensembleOptions.push({ id: ensemble.id, name: ensemble.name });
+            ensembles.push({ id: ensemble.id, name: ensemble.name });
         }
     }
 }
 
-ensembleOptions.sort((a, b) => a.name.localeCompare(b.name));
+ensembles.sort((a, b) => a.name.localeCompare(b.name));
 
-if (ensembleOptions.length === 0) {
+if (ensembles.length === 0) {
     output.text("❌ No ensembles were found in the rehearsal table.");
 } else {
     const selectedEnsembleName = await input.buttonsAsync(
         "Select the ensemble:",
-        ensembleOptions.map(option => option.name)
+        ensembles.map(ensemble => ensemble.name)
     );
-    const selectedEnsemble = ensembleOptions.find(option => option.name === selectedEnsembleName);
+    const selectedEnsemble = ensembles.find(ensemble => ensemble.name === selectedEnsembleName);
 
     if (!selectedEnsemble) {
         output.text("❌ No ensemble was selected.");
     } else {
-        const ensembleRehearsals = rehearsalQuery.records.filter(rehearsal =>
-            linkedIds(rehearsal.getCellValue("Ensemble(s)"))
-                .includes(selectedEnsemble.id)
-        );
-        const selectedRehearsalIds = new Set(ensembleRehearsals.map(record => record.id));
-        const dateOptions = [...new Set(
-            ensembleRehearsals.map(record => dateKey(record.getCellValue("Rehearsal Date"))).filter(Boolean)
-        )].sort((a, b) => a.localeCompare(b));
+        // Keep each rehearsal record separate. Do not deduplicate by calendar date.
+        const columns = rehearsalQuery.records
+            .filter(rehearsal => ids(rehearsal.getCellValue("Ensemble(s)"))
+                .includes(selectedEnsemble.id))
+            .map(rehearsal => ({
+                id: rehearsal.id,
+                date: dateKey(rehearsal.getCellValue("Rehearsal Date"))
+            }))
+            .filter(column => column.date)
+            .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
 
-        if (dateOptions.length === 0) {
+        if (columns.length === 0) {
             output.text(`❌ No rehearsal dates found for ${selectedEnsembleName}.`);
         } else {
             const rosterQuery = await rostersTable.selectRecordsAsync({
                 fields: [rosterPrimaryField, "Ensemble Registered"]
             });
-
+            const ensembleNameKey = nameKey(selectedEnsembleName);
             const students = rosterQuery.records
-                .filter(record => linkedNames(record.getCellValue("Ensemble Registered"))
-                    .includes(normalizedName(selectedEnsembleName)))
-                .sort((a, b) => getStudentName(a).localeCompare(getStudentName(b)));
+                .filter(record => values(record.getCellValue("Ensemble Registered"))
+                    .some(ensemble => nameKey(ensemble) === ensembleNameKey))
+                .sort((a, b) => studentName(a).localeCompare(studentName(b)));
 
-            const statusByAliasAndDate = new Map();
-            const setStatus = (aliases, date, status) => {
+            const status = new Map();
+            const setStatus = (aliases, rehearsalId, value) => {
                 for (const alias of aliases) {
-                    statusByAliasAndDate.set(`${alias}|${date}`, status);
+                    status.set(`${alias}|${rehearsalId}`, value);
                 }
             };
 
             const attendanceQuery = await attendanceTable.selectRecordsAsync({
-                fields: [attendanceDateField, attendanceStudentField, attendanceEnsembleField]
+                fields: [attendanceDateField, attendanceStudentField]
             });
 
             for (const attendance of attendanceQuery.records) {
-                const matchedDates = linkedIds(attendance.getCellValue(attendanceDateField))
-                    .filter(id => selectedRehearsalIds.has(id))
-                    .map(id => rehearsalInfoById.get(id)?.date)
-                    .filter(date => date && dateOptions.includes(date));
+                // The linked rehearsal ID is the authoritative date/ensemble match.
+                const rehearsalIds = ids(attendance.getCellValue(attendanceDateField));
+                const relevantRehearsalIds = rehearsalIds.filter(id => columns.some(column => column.id === id));
+                if (relevantRehearsalIds.length === 0) continue;
 
-                if (matchedDates.length === 0) continue;
+                const studentAliases = aliasKeys(attendance.getCellValue(attendanceStudentField));
+                if (studentAliases.length === 0) continue;
 
-                const attendanceStudentAliases = aliasKeysFromValue(
-                    attendance.getCellValue(attendanceStudentField)
-                );
-                if (attendanceStudentAliases.length === 0) continue;
-
-                for (const date of matchedDates) {
-                    setStatus(attendanceStudentAliases, date, "Present");
+                for (const rehearsalId of relevantRehearsalIds) {
+                    setStatus(studentAliases, rehearsalId, "Present");
                 }
             }
 
             const absenceQuery = await absencesTable.selectRecordsAsync({
-                fields: [absenceStudentField, absenceDateField, absenceTypeField, tardyArrivalField]
+                fields: [absenceStudentField, absenceDateField, absenceTypeField]
             });
 
             for (const absence of absenceQuery.records) {
-                const status = normalizeAbsenceType(absence.getCellValue(absenceTypeField));
-                const aliases = aliasKeysFromValue(absence.getCellValue(absenceStudentField));
+                const studentAliases = aliasKeys(absence.getCellValue(absenceStudentField));
+                if (studentAliases.length === 0) continue;
 
-                if (aliases.length === 0) continue;
+                const absenceRehearsalIds = ids(absence.getCellValue(absenceDateField));
+                const matchingIds = absenceRehearsalIds.filter(id => columns.some(column => column.id === id));
+                if (matchingIds.length === 0) continue;
 
-                for (const rehearsal of ensembleRehearsals) {
-                    const date = dateKey(rehearsal.getCellValue("Rehearsal Date"));
-                    if (!date || !absenceMatchesDate(absence, rehearsal.id, date)) continue;
-                    setStatus(aliases, date, status);
+                for (const rehearsalId of matchingIds) {
+                    setStatus(studentAliases, rehearsalId, absenceStatus(absence.getCellValue(absenceTypeField)));
                 }
             }
 
             const rows = students.map(student => {
-                const row = { "Student Name": getStudentName(student) };
-                const aliases = studentAliases(student, rosterPrimaryField);
+                const row = { "Student Name": studentName(student) };
+                const aliases = rosterAliases(student);
 
-                for (const date of dateOptions) {
-                    let status = "";
+                for (const column of columns) {
+                    let value = "";
                     for (const alias of aliases) {
-                        status = statusByAliasAndDate.get(`${alias}|${date}`);
-                        if (status) break;
+                        value = status.get(`${alias}|${column.id}`);
+                        if (value) break;
                     }
-                    row[displayDate(date)] = status || "";
+                    row[displayDate(column.date)] = value || "";
                 }
-
                 return row;
             });
 
