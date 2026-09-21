@@ -1,4 +1,4 @@
-// Airtable Script: Attendance matrix using the exact Airtable linked-record IDs
+// Airtable Script: Attendance matrix keyed by exact rehearsal and roster record IDs
 const rostersTable = base.getTable("Ensemble Rosters");
 const rehearsalsTable = base.getTable("Rehearsals/Concerts");
 const attendanceTable = base.getTable("Attendance");
@@ -20,13 +20,7 @@ function linkedRecords(value) {
 }
 
 function recordIds(value) {
-    return new Set(linkedRecords(value).map(record => record?.id).filter(Boolean));
-}
-
-function recordNames(value) {
-    return linkedRecords(value)
-        .map(record => record?.name || record?.value || "")
-        .filter(Boolean);
+    return new Set(linkedRecords(value).map(item => item?.id).filter(Boolean));
 }
 
 function dateKey(value) {
@@ -36,11 +30,13 @@ function dateKey(value) {
     }
 
     const valueText = String(value);
-    const iso = valueText.match(/(\d{4})-(\d{2})-(\d{2})/);
-    if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+    const isoMatch = valueText.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
 
-    const us = valueText.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-    if (us) return `${us[3]}-${String(us[1]).padStart(2, "0")}-${String(us[2]).padStart(2, "0")}`;
+    const usMatch = valueText.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (usMatch) {
+        return `${usMatch[3]}-${String(usMatch[1]).padStart(2, "0")}-${String(usMatch[2]).padStart(2, "0")}`;
+    }
 
     return null;
 }
@@ -50,42 +46,31 @@ function displayDate(key) {
     return `${month}/${day}/${year}`;
 }
 
-function normalized(value) {
-    return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function fieldNames(value) {
-    return new Set(linkedRecords(value).map(record => normalized(record?.name || record?.value)));
-}
-
-function rosterStudentName(rosterRecord) {
-    const studentLinks = linkedRecords(rosterRecord.getCellValue(ROSTER_STUDENT_FIELD));
-    return studentLinks[0]?.name || rosterRecord.name || "Unnamed Student";
+function getStudentDisplayName(rosterRecord) {
+    const linkedStudent = linkedRecords(rosterRecord.getCellValue(ROSTER_STUDENT_FIELD))[0];
+    return linkedStudent?.name || rosterRecord.name || "Unnamed Student";
 }
 
 function absenceStatus(value) {
-    const status = normalized(value?.name || value?.value || value);
+    const status = String(value || "").trim().toLowerCase();
     if (status.includes("excus")) return "Excused";
     if (status.includes("tardy") || status.includes("late")) return "Tardy";
     if (status.includes("early") || status.includes("dismiss")) return "Leaving Early";
     return "Absent";
 }
 
-// Load the exact rehearsal records. A rehearsal record is a column identity;
-// its calendar date is only the label displayed to the user.
 const rehearsalQuery = await rehearsalsTable.selectRecordsAsync({
     fields: [REHEARSAL_DATE_FIELD, REHEARSAL_ENSEMBLE_FIELD]
 });
 
 const ensembleOptions = [];
-const ensembleById = new Map();
+const seenEnsembleIds = new Set();
 
 for (const rehearsal of rehearsalQuery.records) {
     for (const ensemble of linkedRecords(rehearsal.getCellValue(REHEARSAL_ENSEMBLE_FIELD))) {
-        if (ensemble?.id && ensemble.name && !ensembleById.has(ensemble.id)) {
-            const option = { id: ensemble.id, name: ensemble.name };
-            ensembleById.set(ensemble.id, option);
-            ensembleOptions.push(option);
+        if (ensemble?.id && ensemble.name && !seenEnsembleIds.has(ensemble.id)) {
+            seenEnsembleIds.add(ensemble.id);
+            ensembleOptions.push({ id: ensemble.id, name: ensemble.name });
         }
     }
 }
@@ -99,14 +84,18 @@ if (ensembleOptions.length === 0) {
         "Select the ensemble:",
         ensembleOptions.map(option => option.name)
     );
-    const selectedEnsemble = ensembleOptions.find(option => option.name === selectedEnsembleName);
+
+    const selectedEnsemble = ensembleOptions.find(
+        option => option.name === selectedEnsembleName
+    );
 
     if (!selectedEnsemble) {
         output.text("❌ No ensemble was selected.");
     } else {
-        const columns = rehearsalQuery.records
-            .filter(rehearsal => recordIds(rehearsal.getCellValue(REHEARSAL_ENSEMBLE_FIELD))
-                .has(selectedEnsemble.id))
+        const rehearsalColumns = rehearsalQuery.records
+            .filter(rehearsal =>
+                recordIds(rehearsal.getCellValue(REHEARSAL_ENSEMBLE_FIELD)).has(selectedEnsemble.id)
+            )
             .map(rehearsal => ({
                 id: rehearsal.id,
                 date: dateKey(rehearsal.getCellValue(REHEARSAL_DATE_FIELD))
@@ -114,7 +103,7 @@ if (ensembleOptions.length === 0) {
             .filter(column => column.date)
             .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
 
-        if (columns.length === 0) {
+        if (rehearsalColumns.length === 0) {
             output.text(`❌ No rehearsal records found for ${selectedEnsembleName}.`);
         } else {
             const rosterQuery = await rostersTable.selectRecordsAsync({
@@ -122,31 +111,29 @@ if (ensembleOptions.length === 0) {
             });
 
             const students = rosterQuery.records
-                .filter(rosterRecord => recordIds(rosterRecord.getCellValue(ROSTER_ENSEMBLE_FIELD))
-                    .has(selectedEnsemble.id))
-                .sort((a, b) => rosterStudentName(a).localeCompare(rosterStudentName(b)));
+                .filter(rosterRecord =>
+                    recordIds(rosterRecord.getCellValue(ROSTER_ENSEMBLE_FIELD)).has(selectedEnsemble.id)
+                )
+                .sort((a, b) => getStudentDisplayName(a).localeCompare(getStudentDisplayName(b)));
 
-            // The keys in this map are the actual Airtable IDs from:
-            // Attendance.Student and Attendance.Date of Attendance.
             const statusByRosterAndRehearsal = new Map();
 
             const attendanceQuery = await attendanceTable.selectRecordsAsync({
                 fields: [ATTENDANCE_REHEARSAL_FIELD, ATTENDANCE_STUDENT_FIELD]
             });
 
-            let matchedAttendanceRecords = 0;
             for (const attendance of attendanceQuery.records) {
                 const rehearsalIds = recordIds(attendance.getCellValue(ATTENDANCE_REHEARSAL_FIELD));
                 const studentIds = recordIds(attendance.getCellValue(ATTENDANCE_STUDENT_FIELD));
-                const matchingColumnIds = columns
+
+                const matchingRehearsalIds = rehearsalColumns
                     .filter(column => rehearsalIds.has(column.id))
                     .map(column => column.id);
 
-                if (matchingColumnIds.length === 0 || studentIds.size === 0) continue;
-                matchedAttendanceRecords++;
+                if (matchingRehearsalIds.length === 0 || studentIds.size === 0) continue;
 
                 for (const studentId of studentIds) {
-                    for (const rehearsalId of matchingColumnIds) {
+                    for (const rehearsalId of matchingRehearsalIds) {
                         statusByRosterAndRehearsal.set(`${studentId}|${rehearsalId}`, "Present");
                     }
                 }
@@ -159,40 +146,47 @@ if (ensembleOptions.length === 0) {
             for (const absence of absenceQuery.records) {
                 const rehearsalIds = recordIds(absence.getCellValue(ABSENCE_REHEARSAL_FIELD));
                 const studentIds = recordIds(absence.getCellValue(ABSENCE_STUDENT_FIELD));
-                const status = absenceStatus(absence.getCellValue(ABSENCE_TYPE_FIELD));
+                const type = absenceStatus(absence.getCellValue(ABSENCE_TYPE_FIELD));
+
+                if (studentIds.size === 0) continue;
 
                 for (const studentId of studentIds) {
-                    for (const column of columns) {
+                    for (const column of rehearsalColumns) {
+                        if (!rehearsalIds.has(column.id)) continue;
                         const key = `${studentId}|${column.id}`;
-                        if (rehearsalIds.has(column.id) && !statusByRosterAndRehearsal.has(key)) {
-                            statusByRosterAndRehearsal.set(key, status);
+                        if (!statusByRosterAndRehearsal.has(key)) {
+                            statusByRosterAndRehearsal.set(key, type);
                         }
                     }
                 }
             }
 
-            // Airtable output.table uses object keys for columns. Add a short
-            // record-ID suffix when two rehearsal records share the same date.
-            const headers = columns.map((column, index) => {
-                const dateHeader = displayDate(column.date);
-                const duplicate = columns.slice(0, index).some(previous => previous.date === column.date);
-                return duplicate ? `${dateHeader} (${column.id.slice(-4)})` : dateHeader;
-            });
+            const headers = [];
+            const usedHeaders = new Set();
+
+            for (const column of rehearsalColumns) {
+                const baseHeader = displayDate(column.date);
+                let header = baseHeader;
+                if (usedHeaders.has(baseHeader)) {
+                    header = `${baseHeader} (${column.id.slice(-4)})`;
+                }
+                usedHeaders.add(baseHeader);
+                headers.push(header);
+            }
 
             const rows = students.map(rosterRecord => {
-                const row = { "Student Name": rosterStudentName(rosterRecord) };
+                const row = { "Student Name": getStudentDisplayName(rosterRecord) };
 
-                for (let index = 0; index < columns.length; index++) {
-                    const column = columns[index];
-                    const value = statusByRosterAndRehearsal.get(`${rosterRecord.id}|${column.id}`) || "";
-                    row[headers[index]] = value;
+                for (let i = 0; i < rehearsalColumns.length; i++) {
+                    const column = rehearsalColumns[i];
+                    row[headers[i]] = statusByRosterAndRehearsal.get(`${rosterRecord.id}|${column.id}`) || "";
                 }
 
                 return row;
             });
 
             output.text(`## ${selectedEnsembleName}`);
-            output.text(`${students.length} students | ${columns.length} rehearsal records | ${matchedAttendanceRecords} matching attendance records`);
+            output.text(`${students.length} students | ${rehearsalColumns.length} rehearsal records`);
             output.table(rows);
         }
     }
