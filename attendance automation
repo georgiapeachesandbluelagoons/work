@@ -32,8 +32,35 @@ const easternToday = new Intl.DateTimeFormat("en-CA", {
 
 function getLinkedIds(record, fieldName) {
     return new Set(
-        (record.getCellValue(fieldName) || []).map(link => link.id)
+        (record.getCellValue(fieldName) || [])
+            .filter(link => link && link.id)
+            .map(link => link.id)
     );
+}
+
+// Some Airtable fields that display linked records are configured as lookup
+// fields and return names/strings instead of linked-record IDs. Keep both the
+// IDs and displayed names so Attendance and Absence Requests are recognized in
+// either configuration.
+function getLinkedReferences(record, fieldName) {
+    const references = record.getCellValue(fieldName) || [];
+    const ids = new Set();
+    const names = new Set();
+
+    for (const reference of references) {
+        if (reference && typeof reference === "object") {
+            if (reference.id) {
+                ids.add(reference.id);
+            }
+            if (reference.name) {
+                names.add(String(reference.name).trim());
+            }
+        } else if (reference !== null && reference !== undefined) {
+            names.add(String(reference).trim());
+        }
+    }
+
+    return { ids, names };
 }
 
 function getEventDateOnly(record) {
@@ -51,8 +78,8 @@ const rosterDetails = new Map();
 
 // Store each student's ensembles and event records already accounted for.
 for (const rosterRecord of rostersQuery.records) {
-    const attendanceIds = getLinkedIds(rosterRecord, attendanceField);
-    const absenceRequestIds = getLinkedIds(
+    const attendance = getLinkedReferences(rosterRecord, attendanceField);
+    const absenceRequests = getLinkedReferences(
         rosterRecord,
         absenceRequestsField
     );
@@ -60,8 +87,12 @@ for (const rosterRecord of rostersQuery.records) {
     rosterDetails.set(rosterRecord.id, {
         ensembleIds: getLinkedIds(rosterRecord, rosterEnsembleField),
         accountedForEventIds: new Set([
-            ...attendanceIds,
-            ...absenceRequestIds
+            ...attendance.ids,
+            ...absenceRequests.ids
+        ]),
+        accountedForEventNames: new Set([
+            ...attendance.names,
+            ...absenceRequests.names
         ]),
         missedEventIds: new Set()
     });
@@ -84,6 +115,12 @@ for (const eventRecord of eventsQuery.records) {
         continue;
     }
 
+    // record.name is the displayed primary-field value for the event. It lets
+    // this work even when Attendance is a lookup that returns event names.
+    const eventName = eventRecord.name
+        ? String(eventRecord.name).trim()
+        : null;
+
     for (const [rosterId, roster] of rosterDetails) {
         const sameEnsemble = [...eventEnsembleIds].some(
             ensembleId => roster.ensembleIds.has(ensembleId)
@@ -94,7 +131,12 @@ for (const eventRecord of eventsQuery.records) {
         }
 
         // An event in either Attendance or Absence Requests is not missed.
-        if (roster.accountedForEventIds.has(eventRecord.id)) {
+        // Check IDs first, then displayed names for lookup/text fields.
+        const alreadyAccountedFor =
+            roster.accountedForEventIds.has(eventRecord.id) ||
+            (eventName && roster.accountedForEventNames.has(eventName));
+
+        if (alreadyAccountedFor) {
             continue;
         }
 
