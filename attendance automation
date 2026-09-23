@@ -5,6 +5,8 @@ const attendanceTable = base.getTable("Attendance");
 const eventDateField = "Rehearsal Date";
 const eventEnsembleField = "Ensemble(s)";
 const rosterEnsembleField = "Ensemble Registered";
+const attendanceRosterField = "Attendance";
+const attendanceDateField = "Rehearsal Date";
 const absenceRequestsField = "Absence Requests";
 const missedRehearsalsField = "Missed Rehearsals";
 
@@ -23,59 +25,16 @@ function getLinkedIds(record, fieldName) {
     );
 }
 
-function getEventDateOnly(record) {
-    const value = record.getCellValue(eventDateField);
+function getDateOnly(record, fieldName) {
+    const value = record.getCellValue(fieldName);
 
     if (!value) {
         return null;
     }
 
+    // Airtable date fields normally return YYYY-MM-DD or an ISO timestamp.
+    // Keep only the calendar-date portion so time zones do not affect matching.
     return String(value).slice(0, 10);
-}
-
-const eventsQuery = await eventsTable.selectRecordsAsync({
-    fields: [eventDateField, eventEnsembleField]
-});
-
-const rostersQuery = await rostersTable.selectRecordsAsync({
-    fields: [
-        rosterEnsembleField,
-        absenceRequestsField,
-        missedRehearsalsField,
-        "Attendance"
-    ]
-});
-
-// Load every field from Attendance. The Attendance values shown on the roster
-// are Attendance-table record IDs (for example recHGIyZCuQw8QAa5), not event
-// record IDs. We identify the event link by matching values in each Attendance
-// row to actual Rehearsals/Concerts record IDs, so no Attendance field name is
-// assumed.
-const attendanceQuery = await attendanceTable.selectRecordsAsync();
-
-const eventIds = new Set(
-    eventsQuery.records.map(function (record) {
-        return record.id;
-    })
-);
-
-const eventIdsByAttendanceId = new Map();
-
-for (const attendanceRecord of attendanceQuery.records) {
-    const linkedEventIds = new Set();
-
-    for (const field of attendanceTable.fields) {
-        const value = attendanceRecord.getCellValue(field.name);
-        const values = Array.isArray(value) ? value : [value];
-
-        for (const item of values) {
-            if (item && item.id && eventIds.has(item.id)) {
-                linkedEventIds.add(item.id);
-            }
-        }
-    }
-
-    eventIdsByAttendanceId.set(attendanceRecord.id, linkedEventIds);
 }
 
 const easternToday = new Intl.DateTimeFormat("en-CA", {
@@ -85,30 +44,54 @@ const easternToday = new Intl.DateTimeFormat("en-CA", {
     day: "2-digit"
 }).format(new Date());
 
+const eventsQuery = await eventsTable.selectRecordsAsync({
+    fields: [eventDateField, eventEnsembleField]
+});
+
+const rostersQuery = await rostersTable.selectRecordsAsync({
+    fields: [
+        rosterEnsembleField,
+        attendanceRosterField,
+        absenceRequestsField,
+        missedRehearsalsField
+    ]
+});
+
+const attendanceQuery = await attendanceTable.selectRecordsAsync({
+    fields: [attendanceDateField]
+});
+
+// Build a map of Attendance-table record ID -> rehearsal date.
+// The Attendance links on Ensemble Rosters contain these record IDs.
+const attendanceDateById = new Map();
+
+for (const attendanceRecord of attendanceQuery.records) {
+    const attendanceDate = getDateOnly(
+        attendanceRecord,
+        attendanceDateField
+    );
+
+    attendanceDateById.set(attendanceRecord.id, attendanceDate);
+}
+
 const rosterDetails = new Map();
 
 for (const rosterRecord of rostersQuery.records) {
-    const attendedEventIds = new Set();
+    const attendedDates = new Set();
     const attendanceRecordIds = getLinkedIds(
         rosterRecord,
-        "Attendance"
+        attendanceRosterField
     );
 
     for (const attendanceRecordId of attendanceRecordIds) {
-        const eventIdsForAttendance = eventIdsByAttendanceId.get(
-            attendanceRecordId
-        );
+        const attendanceDate = attendanceDateById.get(attendanceRecordId);
 
-        if (!eventIdsForAttendance) {
-            continue;
-        }
-
-        for (const eventId of eventIdsForAttendance) {
-            attendedEventIds.add(eventId);
+        if (attendanceDate) {
+            attendedDates.add(attendanceDate);
         }
     }
 
-    const absenceRequestIds = getLinkedIds(
+    const absenceRequestEventIds = getLinkedIds(
         rosterRecord,
         absenceRequestsField
     );
@@ -118,16 +101,14 @@ for (const rosterRecord of rostersQuery.records) {
             rosterRecord,
             rosterEnsembleField
         ),
-        accountedForEventIds: new Set([
-            ...attendedEventIds,
-            ...absenceRequestIds
-        ]),
+        attendedDates: attendedDates,
+        absenceRequestEventIds: absenceRequestEventIds,
         missedEventIds: new Set()
     });
 }
 
 for (const eventRecord of eventsQuery.records) {
-    const eventDate = getEventDateOnly(eventRecord);
+    const eventDate = getDateOnly(eventRecord, eventDateField);
 
     if (!eventDate || eventDate > easternToday) {
         continue;
@@ -153,7 +134,14 @@ for (const eventRecord of eventsQuery.records) {
             continue;
         }
 
-        if (roster.accountedForEventIds.has(eventRecord.id)) {
+        // Attendance is linked through the separate Attendance table, so match
+        // its Rehearsal Date to this event's Rehearsal Date.
+        const attended = roster.attendedDates.has(eventDate);
+
+        // Absence Requests links directly to Rehearsals/Concerts.
+        const excused = roster.absenceRequestEventIds.has(eventRecord.id);
+
+        if (attended || excused) {
             continue;
         }
 
