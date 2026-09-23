@@ -11,12 +11,17 @@ const attendanceEnsembleField = "Ensemble";
 const absenceRequestsField = "Absence Requests";
 const missedRehearsalsField = "Missed Rehearsals";
 
-function getLinkedIds(record, fieldName) {
-    const value = record.getCellValue(fieldName) || [];
-    const values = Array.isArray(value) ? value : [value];
+function getValues(record, fieldName) {
+    const value = record.getCellValue(fieldName);
+    if (!value) {
+        return [];
+    }
+    return Array.isArray(value) ? value : [value];
+}
 
+function getLinkedIds(record, fieldName) {
     return new Set(
-        values
+        getValues(record, fieldName)
             .filter(function (item) {
                 return item && item.id;
             })
@@ -26,18 +31,44 @@ function getLinkedIds(record, fieldName) {
     );
 }
 
-function getDateOnly(record, fieldName) {
-    const value = record.getCellValue(fieldName);
-
-    if (!value) {
-        return null;
-    }
-
-    return String(value).slice(0, 10);
+function getReferenceNames(record, fieldName) {
+    return new Set(
+        getValues(record, fieldName)
+            .map(function (item) {
+                if (item && typeof item === "object") {
+                    return item.name;
+                }
+                return item;
+            })
+            .filter(function (name) {
+                return name !== null && name !== undefined;
+            })
+            .map(function (name) {
+                return String(name).trim().toLowerCase();
+            })
+            .filter(Boolean)
+    );
 }
 
-function makeAttendanceKey(date, ensembleId) {
-    return date + "|" + ensembleId;
+function getDateOnly(record, fieldName) {
+    const value = record.getCellValue(fieldName);
+    return value ? String(value).slice(0, 10) : null;
+}
+
+function hasCommonEnsemble(firstIds, firstNames, secondIds, secondNames) {
+    for (const id of firstIds) {
+        if (secondIds.has(id)) {
+            return true;
+        }
+    }
+
+    for (const name of firstNames) {
+        if (secondNames.has(name)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 const easternToday = new Intl.DateTimeFormat("en-CA", {
@@ -64,13 +95,16 @@ const attendanceQuery = await attendanceTable.selectRecordsAsync({
     fields: [attendanceDateField, attendanceEnsembleField]
 });
 
-// Build a map of Attendance-table record ID to its date and ensemble.
 const attendanceDetailsById = new Map();
 
 for (const attendanceRecord of attendanceQuery.records) {
     attendanceDetailsById.set(attendanceRecord.id, {
         date: getDateOnly(attendanceRecord, attendanceDateField),
         ensembleIds: getLinkedIds(
+            attendanceRecord,
+            attendanceEnsembleField
+        ),
+        ensembleNames: getReferenceNames(
             attendanceRecord,
             attendanceEnsembleField
         )
@@ -87,36 +121,39 @@ for (const rosterRecord of rostersQuery.records) {
     );
 
     for (const attendanceRecordId of attendanceRecordIds) {
-        const attendanceDetails = attendanceDetailsById.get(
-            attendanceRecordId
-        );
+        const attendance = attendanceDetailsById.get(attendanceRecordId);
 
-        if (!attendanceDetails || !attendanceDetails.date) {
+        if (!attendance || !attendance.date) {
             continue;
         }
 
-        for (const ensembleId of attendanceDetails.ensembleIds) {
+        for (const ensembleId of attendance.ensembleIds) {
             attendedKeys.add(
-                makeAttendanceKey(
-                    attendanceDetails.date,
-                    ensembleId
-                )
+                attendance.date + "|id:" + ensembleId
+            );
+        }
+
+        for (const ensembleName of attendance.ensembleNames) {
+            attendedKeys.add(
+                attendance.date + "|name:" + ensembleName
             );
         }
     }
-
-    const absenceRequestEventIds = getLinkedIds(
-        rosterRecord,
-        absenceRequestsField
-    );
 
     rosterDetails.set(rosterRecord.id, {
         ensembleIds: getLinkedIds(
             rosterRecord,
             rosterEnsembleField
         ),
+        ensembleNames: getReferenceNames(
+            rosterRecord,
+            rosterEnsembleField
+        ),
         attendedKeys: attendedKeys,
-        absenceRequestEventIds: absenceRequestEventIds,
+        absenceRequestEventIds: getLinkedIds(
+            rosterRecord,
+            absenceRequestsField
+        ),
         missedEventIds: new Set()
     });
 }
@@ -132,40 +169,48 @@ for (const eventRecord of eventsQuery.records) {
         eventRecord,
         eventEnsembleField
     );
+    const eventEnsembleNames = getReferenceNames(
+        eventRecord,
+        eventEnsembleField
+    );
 
-    if (eventEnsembleIds.size === 0) {
+    if (eventEnsembleIds.size === 0 && eventEnsembleNames.size === 0) {
         continue;
     }
 
     for (const roster of rosterDetails.values()) {
-        const matchingEnsembleIds = Array.from(eventEnsembleIds).filter(
-            function (ensembleId) {
-                return roster.ensembleIds.has(ensembleId);
-            }
+        const sameEnsemble = hasCommonEnsemble(
+            eventEnsembleIds,
+            eventEnsembleNames,
+            roster.ensembleIds,
+            roster.ensembleNames
         );
 
-        if (matchingEnsembleIds.length === 0) {
+        if (!sameEnsemble) {
             continue;
         }
 
-        // Attendance is matched by both date and ensemble. This prevents a
-        // student who attended one ensemble on a date from being treated as
-        // present for a different ensemble on that same date.
-        const attended = matchingEnsembleIds.some(
-            function (ensembleId) {
-                return roster.attendedKeys.has(
-                    makeAttendanceKey(eventDate, ensembleId)
-                );
+        let attended = false;
+
+        for (const ensembleId of eventEnsembleIds) {
+            if (roster.attendedKeys.has(eventDate + "|id:" + ensembleId)) {
+                attended = true;
             }
-        );
+        }
+
+        for (const ensembleName of eventEnsembleNames) {
+            if (roster.attendedKeys.has(
+                eventDate + "|name:" + ensembleName
+            )) {
+                attended = true;
+            }
+        }
 
         const excused = roster.absenceRequestEventIds.has(eventRecord.id);
 
-        if (attended || excused) {
-            continue;
+        if (!attended && !excused) {
+            roster.missedEventIds.add(eventRecord.id);
         }
-
-        roster.missedEventIds.add(eventRecord.id);
     }
 }
 
