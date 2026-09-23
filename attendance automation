@@ -5,7 +5,6 @@ const attendanceTable = base.getTable("Attendance");
 const eventDateField = "Rehearsal Date";
 const eventEnsembleField = "Ensemble(s)";
 const rosterEnsembleField = "Ensemble Registered";
-const attendanceField = "Attendance";
 const absenceRequestsField = "Absence Requests";
 const missedRehearsalsField = "Missed Rehearsals";
 
@@ -34,43 +33,6 @@ function getEventDateOnly(record) {
     return String(value).slice(0, 10);
 }
 
-function findLinkField(table, linkedTableId, fieldToExclude) {
-    const matches = table.fields.filter(function (field) {
-        return (
-            field.name !== fieldToExclude &&
-            field.type === "multipleRecordLinks" &&
-            field.options &&
-            field.options.linkedTableId === linkedTableId
-        );
-    });
-
-    if (matches.length !== 1) {
-        const names = matches.map(function (field) {
-            return field.name;
-        }).join(", ");
-
-        throw new Error(
-            "Expected exactly one link field in the Attendance table to " +
-            "Rehearsals/Concerts and one to Ensemble Rosters. Found event " +
-            "link candidates: " + names
-        );
-    }
-
-    return matches[0].name;
-}
-
-const attendanceEventField = findLinkField(
-    attendanceTable,
-    eventsTable.id,
-    null
-);
-
-const attendanceRosterField = findLinkField(
-    attendanceTable,
-    rostersTable.id,
-    attendanceEventField
-);
-
 const eventsQuery = await eventsTable.selectRecordsAsync({
     fields: [eventDateField, eventEnsembleField]
 });
@@ -78,15 +40,43 @@ const eventsQuery = await eventsTable.selectRecordsAsync({
 const rostersQuery = await rostersTable.selectRecordsAsync({
     fields: [
         rosterEnsembleField,
-        attendanceField,
         absenceRequestsField,
-        missedRehearsalsField
+        missedRehearsalsField,
+        "Attendance"
     ]
 });
 
-const attendanceQuery = await attendanceTable.selectRecordsAsync({
-    fields: [attendanceEventField, attendanceRosterField]
-});
+// Load every field from Attendance. The Attendance values shown on the roster
+// are Attendance-table record IDs (for example recHGIyZCuQw8QAa5), not event
+// record IDs. We identify the event link by matching values in each Attendance
+// row to actual Rehearsals/Concerts record IDs, so no Attendance field name is
+// assumed.
+const attendanceQuery = await attendanceTable.selectRecordsAsync();
+
+const eventIds = new Set(
+    eventsQuery.records.map(function (record) {
+        return record.id;
+    })
+);
+
+const eventIdsByAttendanceId = new Map();
+
+for (const attendanceRecord of attendanceQuery.records) {
+    const linkedEventIds = new Set();
+
+    for (const field of attendanceTable.fields) {
+        const value = attendanceRecord.getCellValue(field.name);
+        const values = Array.isArray(value) ? value : [value];
+
+        for (const item of values) {
+            if (item && item.id && eventIds.has(item.id)) {
+                linkedEventIds.add(item.id);
+            }
+        }
+    }
+
+    eventIdsByAttendanceId.set(attendanceRecord.id, linkedEventIds);
+}
 
 const easternToday = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
@@ -95,75 +85,42 @@ const easternToday = new Intl.DateTimeFormat("en-CA", {
     day: "2-digit"
 }).format(new Date());
 
-const attendanceEventsByRoster = new Map();
-
-// Build a map from each roster record to the rehearsal/concert records
-// represented by that student's Attendance records.
-for (const attendanceRecord of attendanceQuery.records) {
-    const rosterIds = getLinkedIds(
-        attendanceRecord,
-        attendanceRosterField
-    );
-    const eventIds = getLinkedIds(
-        attendanceRecord,
-        attendanceEventField
-    );
-
-    for (const rosterId of rosterIds) {
-        if (!attendanceEventsByRoster.has(rosterId)) {
-            attendanceEventsByRoster.set(rosterId, new Set());
-        }
-
-        const rosterEventIds = attendanceEventsByRoster.get(rosterId);
-
-        for (const eventId of eventIds) {
-            rosterEventIds.add(eventId);
-        }
-    }
-}
-
 const rosterDetails = new Map();
 
 for (const rosterRecord of rostersQuery.records) {
+    const attendedEventIds = new Set();
     const attendanceRecordIds = getLinkedIds(
         rosterRecord,
-        attendanceField
-    );
-    const absenceRequestEventIds = getLinkedIds(
-        rosterRecord,
-        absenceRequestsField
-    );
-    const attendanceEventIds = new Set(
-        attendanceEventsByRoster.get(rosterRecord.id) || []
+        "Attendance"
     );
 
-    // Also follow the Attendance links present directly on this roster record.
-    // This covers cases where the Attendance table's roster link is a lookup
-    // or is not populated consistently.
     for (const attendanceRecordId of attendanceRecordIds) {
-        const attendanceRecord = attendanceQuery.records.find(function (record) {
-            return record.id === attendanceRecordId;
-        });
+        const eventIdsForAttendance = eventIdsByAttendanceId.get(
+            attendanceRecordId
+        );
 
-        if (!attendanceRecord) {
+        if (!eventIdsForAttendance) {
             continue;
         }
 
-        const eventIds = getLinkedIds(
-            attendanceRecord,
-            attendanceEventField
-        );
-
-        for (const eventId of eventIds) {
-            attendanceEventIds.add(eventId);
+        for (const eventId of eventIdsForAttendance) {
+            attendedEventIds.add(eventId);
         }
     }
 
+    const absenceRequestIds = getLinkedIds(
+        rosterRecord,
+        absenceRequestsField
+    );
+
     rosterDetails.set(rosterRecord.id, {
-        ensembleIds: getLinkedIds(rosterRecord, rosterEnsembleField),
+        ensembleIds: getLinkedIds(
+            rosterRecord,
+            rosterEnsembleField
+        ),
         accountedForEventIds: new Set([
-            ...attendanceEventIds,
-            ...absenceRequestEventIds
+            ...attendedEventIds,
+            ...absenceRequestIds
         ]),
         missedEventIds: new Set()
     });
@@ -242,6 +199,4 @@ output.set("easternToday", easternToday);
 output.set("eventsChecked", eventsQuery.records.length);
 output.set("rostersChecked", rostersQuery.records.length);
 output.set("attendanceRowsChecked", attendanceQuery.records.length);
-output.set("attendanceEventField", attendanceEventField);
-output.set("attendanceRosterField", attendanceRosterField);
 output.set("rostersUpdated", updates.length);
