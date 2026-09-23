@@ -4,19 +4,13 @@ const rostersTable = base.getTable("Ensemble Rosters");
 // Exact Airtable field names.
 const eventDateField = "Rehearsal Date";
 const eventEnsembleField = "Ensemble(s)";
-const eventRosterLinksField = "Students Missing";
-
 const rosterEnsembleField = "Ensemble Registered";
 const attendanceField = "Attendance";
 const absenceRequestsField = "Absence Requests";
 const missedRehearsalsField = "Missed Rehearsals";
 
 const eventsQuery = await eventsTable.selectRecordsAsync({
-    fields: [
-        eventDateField,
-        eventEnsembleField,
-        eventRosterLinksField
-    ]
+    fields: [eventDateField, eventEnsembleField]
 });
 
 const rostersQuery = await rostersTable.selectRecordsAsync({
@@ -28,11 +22,13 @@ const rostersQuery = await rostersTable.selectRecordsAsync({
     ]
 });
 
-const today = new Date();
-today.setHours(23, 59, 59, 999);
-
-const missedCounts = new Map();
-const rosterDetails = new Map();
+// Get today's date in Eastern Time as YYYY-MM-DD.
+const easternToday = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+}).format(new Date());
 
 function getLinkedIds(record, fieldName) {
     return new Set(
@@ -40,46 +36,42 @@ function getLinkedIds(record, fieldName) {
     );
 }
 
-// Store each student's ensemble and events already recorded as attended
-// or excused through an absence request.
+function getEventDateOnly(record) {
+    const value = record.getCellValue(eventDateField);
+
+    if (!value) {
+        return null;
+    }
+
+    // Airtable date values begin with the event's calendar date.
+    return String(value).slice(0, 10);
+}
+
+const rosterDetails = new Map();
+
+// Store each student's ensembles and event records already accounted for.
 for (const rosterRecord of rostersQuery.records) {
-    const ensembleIds = getLinkedIds(
-        rosterRecord,
-        rosterEnsembleField
-    );
-
-    const attendanceIds = getLinkedIds(
-        rosterRecord,
-        attendanceField
-    );
-
+    const attendanceIds = getLinkedIds(rosterRecord, attendanceField);
     const absenceRequestIds = getLinkedIds(
         rosterRecord,
         absenceRequestsField
     );
 
     rosterDetails.set(rosterRecord.id, {
-        ensembleIds,
-        recordedEventIds: new Set([
+        ensembleIds: getLinkedIds(rosterRecord, rosterEnsembleField),
+        accountedForEventIds: new Set([
             ...attendanceIds,
             ...absenceRequestIds
-        ])
+        ]),
+        missedEventIds: new Set()
     });
-
-    missedCounts.set(rosterRecord.id, 0);
 }
 
-// Check every event dated today or earlier.
+// Find every past or current event and compare its ensembles to each roster.
 for (const eventRecord of eventsQuery.records) {
-    const eventDateValue = eventRecord.getCellValue(eventDateField);
+    const eventDate = getEventDateOnly(eventRecord);
 
-    if (!eventDateValue) {
-        continue;
-    }
-
-    const eventDate = new Date(eventDateValue);
-
-    if (eventDate > today) {
+    if (!eventDate || eventDate > easternToday) {
         continue;
     }
 
@@ -92,18 +84,7 @@ for (const eventRecord of eventsQuery.records) {
         continue;
     }
 
-    const linkedRosterRecords =
-        eventRecord.getCellValue(eventRosterLinksField) || [];
-
-    for (const linkedRoster of linkedRosterRecords) {
-        const roster = rosterDetails.get(linkedRoster.id);
-
-        if (!roster) {
-            continue;
-        }
-
-        // Only process the student when the event and student share
-        // at least one ensemble.
+    for (const [rosterId, roster] of rosterDetails) {
         const sameEnsemble = [...eventEnsembleIds].some(
             ensembleId => roster.ensembleIds.has(ensembleId)
         );
@@ -112,31 +93,35 @@ for (const eventRecord of eventsQuery.records) {
             continue;
         }
 
-        // Attendance or an absence request means this event is not missed.
-        if (roster.recordedEventIds.has(eventRecord.id)) {
+        // An event in either Attendance or Absence Requests is not missed.
+        if (roster.accountedForEventIds.has(eventRecord.id)) {
             continue;
         }
 
-        missedCounts.set(
-            linkedRoster.id,
-            missedCounts.get(linkedRoster.id) + 1
-        );
+        roster.missedEventIds.add(eventRecord.id);
     }
 }
 
-// Update Missed Rehearsals only when the value changed.
+// Replace each roster's Missed Rehearsals links with the current result.
 const updates = [];
 
 for (const rosterRecord of rostersQuery.records) {
-    const newMissedCount = missedCounts.get(rosterRecord.id) || 0;
-    const currentMissedCount =
-        rosterRecord.getCellValue(missedRehearsalsField) || 0;
+    const roster = rosterDetails.get(rosterRecord.id);
+    const missedEventIds = [...roster.missedEventIds];
+    const currentMissedIds = getLinkedIds(
+        rosterRecord,
+        missedRehearsalsField
+    );
 
-    if (currentMissedCount !== newMissedCount) {
+    const unchanged =
+        currentMissedIds.size === missedEventIds.length &&
+        missedEventIds.every(eventId => currentMissedIds.has(eventId));
+
+    if (!unchanged) {
         updates.push({
             id: rosterRecord.id,
             fields: {
-                [missedRehearsalsField]: newMissedCount
+                [missedRehearsalsField]: missedEventIds.map(id => ({ id }))
             }
         });
     }
@@ -149,6 +134,7 @@ for (let index = 0; index < updates.length; index += 50) {
     );
 }
 
+output.set("easternToday", easternToday);
 output.set("eventsChecked", eventsQuery.records.length);
 output.set("rostersChecked", rostersQuery.records.length);
 output.set("rostersUpdated", updates.length);
