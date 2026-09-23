@@ -1,13 +1,75 @@
 const eventsTable = base.getTable("Rehearsals/Concerts");
 const rostersTable = base.getTable("Ensemble Rosters");
+const attendanceTable = base.getTable("Attendance");
 
-// Exact Airtable field names.
 const eventDateField = "Rehearsal Date";
 const eventEnsembleField = "Ensemble(s)";
 const rosterEnsembleField = "Ensemble Registered";
 const attendanceField = "Attendance";
 const absenceRequestsField = "Absence Requests";
 const missedRehearsalsField = "Missed Rehearsals";
+
+function getLinkedIds(record, fieldName) {
+    const value = record.getCellValue(fieldName) || [];
+    const values = Array.isArray(value) ? value : [value];
+
+    return new Set(
+        values
+            .filter(function (item) {
+                return item && item.id;
+            })
+            .map(function (item) {
+                return item.id;
+            })
+    );
+}
+
+function getEventDateOnly(record) {
+    const value = record.getCellValue(eventDateField);
+
+    if (!value) {
+        return null;
+    }
+
+    return String(value).slice(0, 10);
+}
+
+function findLinkField(table, linkedTableId, fieldToExclude) {
+    const matches = table.fields.filter(function (field) {
+        return (
+            field.name !== fieldToExclude &&
+            field.type === "multipleRecordLinks" &&
+            field.options &&
+            field.options.linkedTableId === linkedTableId
+        );
+    });
+
+    if (matches.length !== 1) {
+        const names = matches.map(function (field) {
+            return field.name;
+        }).join(", ");
+
+        throw new Error(
+            "Expected exactly one link field in the Attendance table to " +
+            "Rehearsals/Concerts and one to Ensemble Rosters. Found event " +
+            "link candidates: " + names
+        );
+    }
+
+    return matches[0].name;
+}
+
+const attendanceEventField = findLinkField(
+    attendanceTable,
+    eventsTable.id,
+    null
+);
+
+const attendanceRosterField = findLinkField(
+    attendanceTable,
+    rostersTable.id,
+    attendanceEventField
+);
 
 const eventsQuery = await eventsTable.selectRecordsAsync({
     fields: [eventDateField, eventEnsembleField]
@@ -22,7 +84,10 @@ const rostersQuery = await rostersTable.selectRecordsAsync({
     ]
 });
 
-// Get today's date in Eastern Time as YYYY-MM-DD.
+const attendanceQuery = await attendanceTable.selectRecordsAsync({
+    fields: [attendanceEventField, attendanceRosterField]
+});
+
 const easternToday = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
     year: "numeric",
@@ -30,75 +95,80 @@ const easternToday = new Intl.DateTimeFormat("en-CA", {
     day: "2-digit"
 }).format(new Date());
 
-function getLinkedIds(record, fieldName) {
-    return new Set(
-        (record.getCellValue(fieldName) || [])
-            .filter(link => link && link.id)
-            .map(link => link.id)
+const attendanceEventsByRoster = new Map();
+
+// Build a map from each roster record to the rehearsal/concert records
+// represented by that student's Attendance records.
+for (const attendanceRecord of attendanceQuery.records) {
+    const rosterIds = getLinkedIds(
+        attendanceRecord,
+        attendanceRosterField
     );
-}
+    const eventIds = getLinkedIds(
+        attendanceRecord,
+        attendanceEventField
+    );
 
-// Some Airtable fields that display linked records are configured as lookup
-// fields and return names/strings instead of linked-record IDs. Keep both the
-// IDs and displayed names so Attendance and Absence Requests are recognized in
-// either configuration.
-function getLinkedReferences(record, fieldName) {
-    const references = record.getCellValue(fieldName) || [];
-    const ids = new Set();
-    const names = new Set();
+    for (const rosterId of rosterIds) {
+        if (!attendanceEventsByRoster.has(rosterId)) {
+            attendanceEventsByRoster.set(rosterId, new Set());
+        }
 
-    for (const reference of references) {
-        if (reference && typeof reference === "object") {
-            if (reference.id) {
-                ids.add(reference.id);
-            }
-            if (reference.name) {
-                names.add(String(reference.name).trim());
-            }
-        } else if (reference !== null && reference !== undefined) {
-            names.add(String(reference).trim());
+        const rosterEventIds = attendanceEventsByRoster.get(rosterId);
+
+        for (const eventId of eventIds) {
+            rosterEventIds.add(eventId);
         }
     }
-
-    return { ids, names };
-}
-
-function getEventDateOnly(record) {
-    const value = record.getCellValue(eventDateField);
-
-    if (!value) {
-        return null;
-    }
-
-    // Airtable date values begin with the event's calendar date.
-    return String(value).slice(0, 10);
 }
 
 const rosterDetails = new Map();
 
-// Store each student's ensembles and event records already accounted for.
 for (const rosterRecord of rostersQuery.records) {
-    const attendance = getLinkedReferences(rosterRecord, attendanceField);
-    const absenceRequests = getLinkedReferences(
+    const attendanceRecordIds = getLinkedIds(
+        rosterRecord,
+        attendanceField
+    );
+    const absenceRequestEventIds = getLinkedIds(
         rosterRecord,
         absenceRequestsField
     );
+    const attendanceEventIds = new Set(
+        attendanceEventsByRoster.get(rosterRecord.id) || []
+    );
+
+    // Also follow the Attendance links present directly on this roster record.
+    // This covers cases where the Attendance table's roster link is a lookup
+    // or is not populated consistently.
+    for (const attendanceRecordId of attendanceRecordIds) {
+        const attendanceRecord = attendanceQuery.records.find(function (record) {
+            return record.id === attendanceRecordId;
+        });
+
+        if (!attendanceRecord) {
+            continue;
+        }
+
+        const eventIds = getLinkedIds(
+            attendanceRecord,
+            attendanceEventField
+        );
+
+        for (const eventId of eventIds) {
+            attendanceEventIds.add(eventId);
+        }
+    }
 
     rosterDetails.set(rosterRecord.id, {
         ensembleIds: getLinkedIds(rosterRecord, rosterEnsembleField),
         accountedForEventIds: new Set([
-            ...attendance.ids,
-            ...absenceRequests.ids
-        ]),
-        accountedForEventNames: new Set([
-            ...attendance.names,
-            ...absenceRequests.names
+            ...attendanceEventIds,
+            ...absenceRequestEventIds
         ]),
         missedEventIds: new Set()
     });
 }
 
-// Find every past or current event and compare its ensembles to each roster.
 for (const eventRecord of eventsQuery.records) {
     const eventDate = getEventDateOnly(eventRecord);
 
@@ -115,28 +185,18 @@ for (const eventRecord of eventsQuery.records) {
         continue;
     }
 
-    // record.name is the displayed primary-field value for the event. It lets
-    // this work even when Attendance is a lookup that returns event names.
-    const eventName = eventRecord.name
-        ? String(eventRecord.name).trim()
-        : null;
-
-    for (const [rosterId, roster] of rosterDetails) {
-        const sameEnsemble = [...eventEnsembleIds].some(
-            ensembleId => roster.ensembleIds.has(ensembleId)
+    for (const roster of rosterDetails.values()) {
+        const sameEnsemble = Array.from(eventEnsembleIds).some(
+            function (ensembleId) {
+                return roster.ensembleIds.has(ensembleId);
+            }
         );
 
         if (!sameEnsemble) {
             continue;
         }
 
-        // An event in either Attendance or Absence Requests is not missed.
-        // Check IDs first, then displayed names for lookup/text fields.
-        const alreadyAccountedFor =
-            roster.accountedForEventIds.has(eventRecord.id) ||
-            (eventName && roster.accountedForEventNames.has(eventName));
-
-        if (alreadyAccountedFor) {
+        if (roster.accountedForEventIds.has(eventRecord.id)) {
             continue;
         }
 
@@ -144,12 +204,11 @@ for (const eventRecord of eventsQuery.records) {
     }
 }
 
-// Replace each roster's Missed Rehearsals links with the current result.
 const updates = [];
 
 for (const rosterRecord of rostersQuery.records) {
     const roster = rosterDetails.get(rosterRecord.id);
-    const missedEventIds = [...roster.missedEventIds];
+    const missedEventIds = Array.from(roster.missedEventIds);
     const currentMissedIds = getLinkedIds(
         rosterRecord,
         missedRehearsalsField
@@ -157,19 +216,22 @@ for (const rosterRecord of rostersQuery.records) {
 
     const unchanged =
         currentMissedIds.size === missedEventIds.length &&
-        missedEventIds.every(eventId => currentMissedIds.has(eventId));
+        missedEventIds.every(function (eventId) {
+            return currentMissedIds.has(eventId);
+        });
 
     if (!unchanged) {
         updates.push({
             id: rosterRecord.id,
             fields: {
-                [missedRehearsalsField]: missedEventIds.map(id => ({ id }))
+                [missedRehearsalsField]: missedEventIds.map(function (id) {
+                    return { id: id };
+                })
             }
         });
     }
 }
 
-// Airtable allows a maximum of 50 records per update request.
 for (let index = 0; index < updates.length; index += 50) {
     await rostersTable.updateRecordsAsync(
         updates.slice(index, index + 50)
@@ -179,4 +241,7 @@ for (let index = 0; index < updates.length; index += 50) {
 output.set("easternToday", easternToday);
 output.set("eventsChecked", eventsQuery.records.length);
 output.set("rostersChecked", rostersQuery.records.length);
+output.set("attendanceRowsChecked", attendanceQuery.records.length);
+output.set("attendanceEventField", attendanceEventField);
+output.set("attendanceRosterField", attendanceRosterField);
 output.set("rostersUpdated", updates.length);
