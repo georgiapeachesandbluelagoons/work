@@ -7,6 +7,7 @@ const eventEnsembleField = "Ensemble(s)";
 const rosterEnsembleField = "Ensemble Registered";
 const attendanceRosterField = "Attendance";
 const attendanceDateField = "Rehearsal Date";
+const attendanceEnsembleField = "Ensemble";
 const absenceRequestsField = "Absence Requests";
 const missedRehearsalsField = "Missed Rehearsals";
 
@@ -32,9 +33,11 @@ function getDateOnly(record, fieldName) {
         return null;
     }
 
-    // Airtable date fields normally return YYYY-MM-DD or an ISO timestamp.
-    // Keep only the calendar-date portion so time zones do not affect matching.
     return String(value).slice(0, 10);
+}
+
+function makeAttendanceKey(date, ensembleId) {
+    return date + "|" + ensembleId;
 }
 
 const easternToday = new Intl.DateTimeFormat("en-CA", {
@@ -58,36 +61,47 @@ const rostersQuery = await rostersTable.selectRecordsAsync({
 });
 
 const attendanceQuery = await attendanceTable.selectRecordsAsync({
-    fields: [attendanceDateField]
+    fields: [attendanceDateField, attendanceEnsembleField]
 });
 
-// Build a map of Attendance-table record ID -> rehearsal date.
-// The Attendance links on Ensemble Rosters contain these record IDs.
-const attendanceDateById = new Map();
+// Build a map of Attendance-table record ID to its date and ensemble.
+const attendanceDetailsById = new Map();
 
 for (const attendanceRecord of attendanceQuery.records) {
-    const attendanceDate = getDateOnly(
-        attendanceRecord,
-        attendanceDateField
-    );
-
-    attendanceDateById.set(attendanceRecord.id, attendanceDate);
+    attendanceDetailsById.set(attendanceRecord.id, {
+        date: getDateOnly(attendanceRecord, attendanceDateField),
+        ensembleIds: getLinkedIds(
+            attendanceRecord,
+            attendanceEnsembleField
+        )
+    });
 }
 
 const rosterDetails = new Map();
 
 for (const rosterRecord of rostersQuery.records) {
-    const attendedDates = new Set();
+    const attendedKeys = new Set();
     const attendanceRecordIds = getLinkedIds(
         rosterRecord,
         attendanceRosterField
     );
 
     for (const attendanceRecordId of attendanceRecordIds) {
-        const attendanceDate = attendanceDateById.get(attendanceRecordId);
+        const attendanceDetails = attendanceDetailsById.get(
+            attendanceRecordId
+        );
 
-        if (attendanceDate) {
-            attendedDates.add(attendanceDate);
+        if (!attendanceDetails || !attendanceDetails.date) {
+            continue;
+        }
+
+        for (const ensembleId of attendanceDetails.ensembleIds) {
+            attendedKeys.add(
+                makeAttendanceKey(
+                    attendanceDetails.date,
+                    ensembleId
+                )
+            );
         }
     }
 
@@ -101,7 +115,7 @@ for (const rosterRecord of rostersQuery.records) {
             rosterRecord,
             rosterEnsembleField
         ),
-        attendedDates: attendedDates,
+        attendedKeys: attendedKeys,
         absenceRequestEventIds: absenceRequestEventIds,
         missedEventIds: new Set()
     });
@@ -124,21 +138,27 @@ for (const eventRecord of eventsQuery.records) {
     }
 
     for (const roster of rosterDetails.values()) {
-        const sameEnsemble = Array.from(eventEnsembleIds).some(
+        const matchingEnsembleIds = Array.from(eventEnsembleIds).filter(
             function (ensembleId) {
                 return roster.ensembleIds.has(ensembleId);
             }
         );
 
-        if (!sameEnsemble) {
+        if (matchingEnsembleIds.length === 0) {
             continue;
         }
 
-        // Attendance is linked through the separate Attendance table, so match
-        // its Rehearsal Date to this event's Rehearsal Date.
-        const attended = roster.attendedDates.has(eventDate);
+        // Attendance is matched by both date and ensemble. This prevents a
+        // student who attended one ensemble on a date from being treated as
+        // present for a different ensemble on that same date.
+        const attended = matchingEnsembleIds.some(
+            function (ensembleId) {
+                return roster.attendedKeys.has(
+                    makeAttendanceKey(eventDate, ensembleId)
+                );
+            }
+        );
 
-        // Absence Requests links directly to Rehearsals/Concerts.
         const excused = roster.absenceRequestEventIds.has(eventRecord.id);
 
         if (attended || excused) {
