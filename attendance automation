@@ -2,60 +2,147 @@ const eventsTable = base.getTable("Rehearsals/Concerts");
 const rostersTable = base.getTable("Ensemble Rosters");
 const attendanceTable = base.getTable("Attendance");
 
+// Rehearsals/Concerts fields.
 const eventDateField = "Rehearsal Date";
 const eventEnsembleField = "Ensemble(s)";
+
+// Ensemble Rosters fields.
 const rosterEnsembleField = "Ensemble Registered";
 const attendanceRosterField = "Attendance";
-const attendanceDateField = "Rehearsal Date";
-const attendanceEnsembleField = "Ensemble";
 const absenceRequestsField = "Absence Requests";
 const missedRehearsalsField = "Missed Rehearsals";
 
+// Attendance fields.
+const attendanceDateField = "Rehearsal Date";
+const attendanceEnsembleField = "Ensemble";
+
 function getValues(record, fieldName) {
     const value = record.getCellValue(fieldName);
-    if (!value) {
+
+    if (value === null || value === undefined) {
         return [];
     }
+
     return Array.isArray(value) ? value : [value];
 }
 
 function getLinkedIds(record, fieldName) {
     return new Set(
         getValues(record, fieldName)
-            .filter(function (item) {
-                return item && item.id;
+            .filter(function (value) {
+                return value && typeof value === "object" && value.id;
             })
-            .map(function (item) {
-                return item.id;
+            .map(function (value) {
+                return value.id;
             })
     );
 }
 
 function getReferenceNames(record, fieldName) {
-    return new Set(
-        getValues(record, fieldName)
-            .map(function (item) {
-                if (item && typeof item === "object") {
-                    return item.name;
-                }
-                return item;
-            })
-            .filter(function (name) {
-                return name !== null && name !== undefined;
-            })
-            .map(function (name) {
-                return String(name).trim().toLowerCase();
-            })
-            .filter(Boolean)
-    );
+    const names = new Set();
+
+    for (const value of getValues(record, fieldName)) {
+        let name = value;
+
+        if (value && typeof value === "object") {
+            name = value.name || value.value;
+        }
+
+        if (name === null || name === undefined) {
+            continue;
+        }
+
+        const normalizedName = String(name).trim().toLowerCase();
+
+        if (normalizedName) {
+            names.add(normalizedName);
+        }
+    }
+
+    return names;
+}
+
+function addLeadingZero(value) {
+    const text = String(value);
+    return text.length === 1 ? "0" + text : text;
 }
 
 function getDateOnly(record, fieldName) {
-    const value = record.getCellValue(fieldName);
-    return value ? String(value).slice(0, 10) : null;
+    for (const value of getValues(record, fieldName)) {
+        let text = value;
+
+        if (value && typeof value === "object") {
+            text = value.name || value.value;
+        }
+
+        if (text === null || text === undefined) {
+            continue;
+        }
+
+        text = String(text).trim();
+
+        // Handles YYYY-MM-DD and YYYY-MM-DDTHH:mm:ss.
+        if (
+            text.length >= 10 &&
+            text.charAt(4) === "-" &&
+            text.charAt(7) === "-"
+        ) {
+            return (
+                text.substring(0, 4) +
+                "-" +
+                addLeadingZero(text.substring(5, 7)) +
+                "-" +
+                addLeadingZero(text.substring(8, 10))
+            );
+        }
+
+        // Handles M/D/YYYY and MM/DD/YYYY.
+        const slashParts = text.split("/");
+
+        if (slashParts.length === 3) {
+            const month = slashParts[0].trim();
+            const day = slashParts[1].trim();
+            const year = slashParts[2].trim();
+
+            if (
+                year.length === 4 &&
+                !isNaN(Number(month)) &&
+                !isNaN(Number(day)) &&
+                !isNaN(Number(year))
+            ) {
+                return (
+                    year +
+                    "-" +
+                    addLeadingZero(month) +
+                    "-" +
+                    addLeadingZero(day)
+                );
+            }
+        }
+
+        // Handles values such as "September 9, 2026".
+        const parsedDate = new Date(text);
+
+        if (!isNaN(parsedDate.getTime())) {
+            return (
+                parsedDate.getFullYear() +
+                "-" +
+                addLeadingZero(parsedDate.getMonth() + 1) +
+                "-" +
+                addLeadingZero(parsedDate.getDate())
+            );
+        }
+    }
+
+    return null;
 }
 
-function hasCommonEnsemble(firstIds, firstNames, secondIds, secondNames) {
+function hasCommonEnsemble(
+    firstIds,
+    firstNames,
+    secondIds,
+    secondNames
+) {
     for (const id of firstIds) {
         if (secondIds.has(id)) {
             return true;
@@ -64,6 +151,27 @@ function hasCommonEnsemble(firstIds, firstNames, secondIds, secondNames) {
 
     for (const name of firstNames) {
         if (secondNames.has(name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function hasMatchingAttendance(
+    roster,
+    eventDate,
+    eventEnsembleIds,
+    eventEnsembleNames
+) {
+    for (const ensembleId of eventEnsembleIds) {
+        if (roster.attendedKeys.has(eventDate + "|id:" + ensembleId)) {
+            return true;
+        }
+    }
+
+    for (const ensembleName of eventEnsembleNames) {
+        if (roster.attendedKeys.has(eventDate + "|name:" + ensembleName)) {
             return true;
         }
     }
@@ -128,27 +236,17 @@ for (const rosterRecord of rostersQuery.records) {
         }
 
         for (const ensembleId of attendance.ensembleIds) {
-            attendedKeys.add(
-                attendance.date + "|id:" + ensembleId
-            );
+            attendedKeys.add(attendance.date + "|id:" + ensembleId);
         }
 
         for (const ensembleName of attendance.ensembleNames) {
-            attendedKeys.add(
-                attendance.date + "|name:" + ensembleName
-            );
+            attendedKeys.add(attendance.date + "|name:" + ensembleName);
         }
     }
 
     rosterDetails.set(rosterRecord.id, {
-        ensembleIds: getLinkedIds(
-            rosterRecord,
-            rosterEnsembleField
-        ),
-        ensembleNames: getReferenceNames(
-            rosterRecord,
-            rosterEnsembleField
-        ),
+        ensembleIds: getLinkedIds(rosterRecord, rosterEnsembleField),
+        ensembleNames: getReferenceNames(rosterRecord, rosterEnsembleField),
         attendedKeys: attendedKeys,
         absenceRequestEventIds: getLinkedIds(
             rosterRecord,
@@ -190,22 +288,12 @@ for (const eventRecord of eventsQuery.records) {
             continue;
         }
 
-        let attended = false;
-
-        for (const ensembleId of eventEnsembleIds) {
-            if (roster.attendedKeys.has(eventDate + "|id:" + ensembleId)) {
-                attended = true;
-            }
-        }
-
-        for (const ensembleName of eventEnsembleNames) {
-            if (roster.attendedKeys.has(
-                eventDate + "|name:" + ensembleName
-            )) {
-                attended = true;
-            }
-        }
-
+        const attended = hasMatchingAttendance(
+            roster,
+            eventDate,
+            eventEnsembleIds,
+            eventEnsembleNames
+        );
         const excused = roster.absenceRequestEventIds.has(eventRecord.id);
 
         if (!attended && !excused) {
@@ -214,19 +302,29 @@ for (const eventRecord of eventsQuery.records) {
     }
 }
 
+// Rebuild Missed Rehearsals from scratch. This explicitly removes any stale
+// link that is now present in Attendance or Absence Requests, because only
+// genuinely missed event IDs are included in the replacement value.
 const updates = [];
+let staleLinksRemoved = 0;
 
 for (const rosterRecord of rostersQuery.records) {
     const roster = rosterDetails.get(rosterRecord.id);
-    const missedEventIds = Array.from(roster.missedEventIds);
+    const newMissedIds = Array.from(roster.missedEventIds);
     const currentMissedIds = getLinkedIds(
         rosterRecord,
         missedRehearsalsField
     );
 
+    for (const currentMissedId of currentMissedIds) {
+        if (!roster.missedEventIds.has(currentMissedId)) {
+            staleLinksRemoved += 1;
+        }
+    }
+
     const unchanged =
-        currentMissedIds.size === missedEventIds.length &&
-        missedEventIds.every(function (eventId) {
+        currentMissedIds.size === newMissedIds.length &&
+        newMissedIds.every(function (eventId) {
             return currentMissedIds.has(eventId);
         });
 
@@ -234,7 +332,7 @@ for (const rosterRecord of rostersQuery.records) {
         updates.push({
             id: rosterRecord.id,
             fields: {
-                [missedRehearsalsField]: missedEventIds.map(function (id) {
+                [missedRehearsalsField]: newMissedIds.map(function (id) {
                     return { id: id };
                 })
             }
@@ -242,6 +340,7 @@ for (const rosterRecord of rostersQuery.records) {
     }
 }
 
+// Airtable allows a maximum of 50 records per update request.
 for (let index = 0; index < updates.length; index += 50) {
     await rostersTable.updateRecordsAsync(
         updates.slice(index, index + 50)
@@ -253,3 +352,4 @@ output.set("eventsChecked", eventsQuery.records.length);
 output.set("rostersChecked", rostersQuery.records.length);
 output.set("attendanceRowsChecked", attendanceQuery.records.length);
 output.set("rostersUpdated", updates.length);
+output.set("staleMissedLinksRemoved", staleLinksRemoved);
