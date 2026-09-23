@@ -1,12 +1,12 @@
 const eventsTable = base.getTable("Rehearsals/Concerts");
 const rostersTable = base.getTable("Ensemble Rosters");
 
-// Confirm these field names match your Airtable base.
-const eventDateField = "Date";
-const eventEnsembleField = "Ensemble";
-const eventRosterLinksField = "Ensemble Rosters";
+// Exact Airtable field names.
+const eventDateField = "Rehearsal Date";
+const eventEnsembleField = "Ensemble(s)";
+const eventRosterLinksField = "Students Missing";
 
-const rosterEnsembleField = "Ensemble";
+const rosterEnsembleField = "Ensemble Registered";
 const attendanceField = "Attendance";
 const absenceRequestsField = "Absence Requests";
 const missedRehearsalsField = "Missed Rehearsals";
@@ -36,12 +36,12 @@ const rosterDetails = new Map();
 
 function getLinkedIds(record, fieldName) {
     return new Set(
-        (record.getCellValue(fieldName) || [])
-            .map(link => link.id)
+        (record.getCellValue(fieldName) || []).map(link => link.id)
     );
 }
 
-// Store each student's ensemble and recorded event IDs.
+// Store each student's ensemble and events already recorded as attended
+// or excused through an absence request.
 for (const rosterRecord of rostersQuery.records) {
     const ensembleIds = getLinkedIds(
         rosterRecord,
@@ -69,10 +69,9 @@ for (const rosterRecord of rostersQuery.records) {
     missedCounts.set(rosterRecord.id, 0);
 }
 
-// Check every event through today.
+// Check every event dated today or earlier.
 for (const eventRecord of eventsQuery.records) {
-    const eventDateValue =
-        eventRecord.getCellValue(eventDateField);
+    const eventDateValue = eventRecord.getCellValue(eventDateField);
 
     if (!eventDateValue) {
         continue;
@@ -103,8 +102,8 @@ for (const eventRecord of eventsQuery.records) {
             continue;
         }
 
-        // Only process this student if the event and student
-        // share at least one ensemble.
+        // Only process the student when the event and student share
+        // at least one ensemble.
         const sameEnsemble = [...eventEnsembleIds].some(
             ensembleId => roster.ensembleIds.has(ensembleId)
         );
@@ -113,8 +112,7 @@ for (const eventRecord of eventsQuery.records) {
             continue;
         }
 
-        // Attendance or an absence request means this event
-        // should not count as missed.
+        // Attendance or an absence request means this event is not missed.
         if (roster.recordedEventIds.has(eventRecord.id)) {
             continue;
         }
@@ -126,13 +124,11 @@ for (const eventRecord of eventsQuery.records) {
     }
 }
 
-// Update Missed Rehearsals.
+// Update Missed Rehearsals only when the value changed.
 const updates = [];
 
 for (const rosterRecord of rostersQuery.records) {
-    const newMissedCount =
-        missedCounts.get(rosterRecord.id) || 0;
-
+    const newMissedCount = missedCounts.get(rosterRecord.id) || 0;
     const currentMissedCount =
         rosterRecord.getCellValue(missedRehearsalsField) || 0;
 
@@ -146,7 +142,7 @@ for (const rosterRecord of rostersQuery.records) {
     }
 }
 
-// Airtable allows up to 50 updates per request.
+// Airtable allows a maximum of 50 records per update request.
 for (let index = 0; index < updates.length; index += 50) {
     await rostersTable.updateRecordsAsync(
         updates.slice(index, index + 50)
