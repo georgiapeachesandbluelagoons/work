@@ -1,1 +1,158 @@
+const eventsTable = base.getTable("Rehearsals/Concerts");
+const rostersTable = base.getTable("Ensemble Rosters");
 
+// Confirm these field names match your Airtable base.
+const eventDateField = "Date";
+const eventEnsembleField = "Ensemble";
+const eventRosterLinksField = "Ensemble Rosters";
+
+const rosterEnsembleField = "Ensemble";
+const attendanceField = "Attendance";
+const absenceRequestsField = "Absence Requests";
+const missedRehearsalsField = "Missed Rehearsals";
+
+const eventsQuery = await eventsTable.selectRecordsAsync({
+    fields: [
+        eventDateField,
+        eventEnsembleField,
+        eventRosterLinksField
+    ]
+});
+
+const rostersQuery = await rostersTable.selectRecordsAsync({
+    fields: [
+        rosterEnsembleField,
+        attendanceField,
+        absenceRequestsField,
+        missedRehearsalsField
+    ]
+});
+
+const today = new Date();
+today.setHours(23, 59, 59, 999);
+
+const missedCounts = new Map();
+const rosterDetails = new Map();
+
+function getLinkedIds(record, fieldName) {
+    return new Set(
+        (record.getCellValue(fieldName) || [])
+            .map(link => link.id)
+    );
+}
+
+// Store each student's ensemble and recorded event IDs.
+for (const rosterRecord of rostersQuery.records) {
+    const ensembleIds = getLinkedIds(
+        rosterRecord,
+        rosterEnsembleField
+    );
+
+    const attendanceIds = getLinkedIds(
+        rosterRecord,
+        attendanceField
+    );
+
+    const absenceRequestIds = getLinkedIds(
+        rosterRecord,
+        absenceRequestsField
+    );
+
+    rosterDetails.set(rosterRecord.id, {
+        ensembleIds,
+        recordedEventIds: new Set([
+            ...attendanceIds,
+            ...absenceRequestIds
+        ])
+    });
+
+    missedCounts.set(rosterRecord.id, 0);
+}
+
+// Check every event through today.
+for (const eventRecord of eventsQuery.records) {
+    const eventDateValue =
+        eventRecord.getCellValue(eventDateField);
+
+    if (!eventDateValue) {
+        continue;
+    }
+
+    const eventDate = new Date(eventDateValue);
+
+    if (eventDate > today) {
+        continue;
+    }
+
+    const eventEnsembleIds = getLinkedIds(
+        eventRecord,
+        eventEnsembleField
+    );
+
+    if (eventEnsembleIds.size === 0) {
+        continue;
+    }
+
+    const linkedRosterRecords =
+        eventRecord.getCellValue(eventRosterLinksField) || [];
+
+    for (const linkedRoster of linkedRosterRecords) {
+        const roster = rosterDetails.get(linkedRoster.id);
+
+        if (!roster) {
+            continue;
+        }
+
+        // Only process this student if the event and student
+        // share at least one ensemble.
+        const sameEnsemble = [...eventEnsembleIds].some(
+            ensembleId => roster.ensembleIds.has(ensembleId)
+        );
+
+        if (!sameEnsemble) {
+            continue;
+        }
+
+        // Attendance or an absence request means this event
+        // should not count as missed.
+        if (roster.recordedEventIds.has(eventRecord.id)) {
+            continue;
+        }
+
+        missedCounts.set(
+            linkedRoster.id,
+            missedCounts.get(linkedRoster.id) + 1
+        );
+    }
+}
+
+// Update Missed Rehearsals.
+const updates = [];
+
+for (const rosterRecord of rostersQuery.records) {
+    const newMissedCount =
+        missedCounts.get(rosterRecord.id) || 0;
+
+    const currentMissedCount =
+        rosterRecord.getCellValue(missedRehearsalsField) || 0;
+
+    if (currentMissedCount !== newMissedCount) {
+        updates.push({
+            id: rosterRecord.id,
+            fields: {
+                [missedRehearsalsField]: newMissedCount
+            }
+        });
+    }
+}
+
+// Airtable allows up to 50 updates per request.
+for (let index = 0; index < updates.length; index += 50) {
+    await rostersTable.updateRecordsAsync(
+        updates.slice(index, index + 50)
+    );
+}
+
+output.set("eventsChecked", eventsQuery.records.length);
+output.set("rostersChecked", rostersQuery.records.length);
+output.set("rostersUpdated", updates.length);
