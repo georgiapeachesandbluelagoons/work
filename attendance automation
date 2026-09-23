@@ -2,184 +2,93 @@ const eventsTable = base.getTable("Rehearsals/Concerts");
 const rostersTable = base.getTable("Ensemble Rosters");
 const attendanceTable = base.getTable("Attendance");
 
-// Rehearsals/Concerts fields.
 const eventDateField = "Rehearsal Date";
 const eventEnsembleField = "Ensemble(s)";
-
-// Ensemble Rosters fields.
 const rosterEnsembleField = "Ensemble Registered";
 const attendanceRosterField = "Attendance";
+const attendanceDateField = "Rehearsal Date";
+const attendanceEnsembleField = "Ensemble";
 const absenceRequestsField = "Absence Requests";
 const missedRehearsalsField = "Missed Rehearsals";
 
-// Attendance fields.
-const attendanceDateField = "Rehearsal Date";
-const attendanceEnsembleField = "Ensemble";
-
-function getValues(record, fieldName) {
+function values(record, fieldName) {
     const value = record.getCellValue(fieldName);
-
-    if (value === null || value === undefined) {
-        return [];
-    }
-
+    if (value === null || value === undefined) return [];
     return Array.isArray(value) ? value : [value];
 }
 
-function getLinkedIds(record, fieldName) {
-    return new Set(
-        getValues(record, fieldName)
-            .filter(function (value) {
-                return value && typeof value === "object" && value.id;
-            })
-            .map(function (value) {
-                return value.id;
-            })
-    );
+function linkedIds(record, fieldName) {
+    return new Set(values(record, fieldName)
+        .filter(function (item) { return item && item.id; })
+        .map(function (item) { return item.id; }));
 }
 
-function getReferenceNames(record, fieldName) {
-    const names = new Set();
-
-    for (const value of getValues(record, fieldName)) {
-        let name = value;
-
-        if (value && typeof value === "object") {
-            name = value.name || value.value;
-        }
-
-        if (name === null || name === undefined) {
-            continue;
-        }
-
-        const normalizedName = String(name).trim().toLowerCase();
-
-        if (normalizedName) {
-            names.add(normalizedName);
+function names(record, fieldName) {
+    const result = new Set();
+    for (const item of values(record, fieldName)) {
+        const name = item && typeof item === "object"
+            ? (item.name || item.value)
+            : item;
+        if (name !== null && name !== undefined) {
+            const normalized = String(name).trim().toLowerCase();
+            if (normalized) result.add(normalized);
         }
     }
-
-    return names;
+    return result;
 }
 
-function addLeadingZero(value) {
+function zero(value) {
     const text = String(value);
     return text.length === 1 ? "0" + text : text;
 }
 
-function getDateOnly(record, fieldName) {
-    for (const value of getValues(record, fieldName)) {
-        let text = value;
-
-        if (value && typeof value === "object") {
-            text = value.name || value.value;
-        }
-
-        if (text === null || text === undefined) {
-            continue;
-        }
-
+function dateOnly(record, fieldName) {
+    for (const item of values(record, fieldName)) {
+        let text = item && typeof item === "object"
+            ? (item.name || item.value)
+            : item;
+        if (text === null || text === undefined) continue;
         text = String(text).trim();
 
-        // Handles YYYY-MM-DD and YYYY-MM-DDTHH:mm:ss.
-        if (
-            text.length >= 10 &&
-            text.charAt(4) === "-" &&
-            text.charAt(7) === "-"
-        ) {
-            return (
-                text.substring(0, 4) +
-                "-" +
-                addLeadingZero(text.substring(5, 7)) +
-                "-" +
-                addLeadingZero(text.substring(8, 10))
-            );
+        if (text.length >= 10 && text.charAt(4) === "-" && text.charAt(7) === "-") {
+            return text.substring(0, 4) + "-" +
+                zero(text.substring(5, 7)) + "-" +
+                zero(text.substring(8, 10));
         }
 
-        // Handles M/D/YYYY and MM/DD/YYYY.
-        const slashParts = text.split("/");
-
-        if (slashParts.length === 3) {
-            const month = slashParts[0].trim();
-            const day = slashParts[1].trim();
-            const year = slashParts[2].trim();
-
-            if (
-                year.length === 4 &&
-                !isNaN(Number(month)) &&
-                !isNaN(Number(day)) &&
-                !isNaN(Number(year))
-            ) {
-                return (
-                    year +
-                    "-" +
-                    addLeadingZero(month) +
-                    "-" +
-                    addLeadingZero(day)
-                );
-            }
+        const parts = text.split("/");
+        if (parts.length === 3 && parts[2].trim().length === 4) {
+            return parts[2].trim() + "-" + zero(parts[0].trim()) +
+                "-" + zero(parts[1].trim());
         }
 
-        // Handles values such as "September 9, 2026".
-        const parsedDate = new Date(text);
-
-        if (!isNaN(parsedDate.getTime())) {
-            return (
-                parsedDate.getFullYear() +
-                "-" +
-                addLeadingZero(parsedDate.getMonth() + 1) +
-                "-" +
-                addLeadingZero(parsedDate.getDate())
-            );
+        const parsed = new Date(text);
+        if (!isNaN(parsed.getTime())) {
+            return parsed.getFullYear() + "-" +
+                zero(parsed.getMonth() + 1) + "-" +
+                zero(parsed.getDate());
         }
     }
-
     return null;
 }
 
-function hasCommonEnsemble(
-    firstIds,
-    firstNames,
-    secondIds,
-    secondNames
-) {
-    for (const id of firstIds) {
-        if (secondIds.has(id)) {
-            return true;
-        }
-    }
-
-    for (const name of firstNames) {
-        if (secondNames.has(name)) {
-            return true;
-        }
-    }
-
+function common(idsA, namesA, idsB, namesB) {
+    for (const id of idsA) if (idsB.has(id)) return true;
+    for (const name of namesA) if (namesB.has(name)) return true;
     return false;
 }
 
-function hasMatchingAttendance(
-    roster,
-    eventDate,
-    eventEnsembleIds,
-    eventEnsembleNames
-) {
-    for (const ensembleId of eventEnsembleIds) {
-        if (roster.attendedKeys.has(eventDate + "|id:" + ensembleId)) {
-            return true;
-        }
+function hasAttendance(roster, date, eventIds, eventNames) {
+    for (const id of eventIds) {
+        if (roster.attendanceKeys.has(date + "|id:" + id)) return true;
     }
-
-    for (const ensembleName of eventEnsembleNames) {
-        if (roster.attendedKeys.has(eventDate + "|name:" + ensembleName)) {
-            return true;
-        }
+    for (const name of eventNames) {
+        if (roster.attendanceKeys.has(date + "|name:" + name)) return true;
     }
-
     return false;
 }
 
-const easternToday = new Intl.DateTimeFormat("en-CA", {
+const today = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
     year: "numeric",
     month: "2-digit",
@@ -189,167 +98,113 @@ const easternToday = new Intl.DateTimeFormat("en-CA", {
 const eventsQuery = await eventsTable.selectRecordsAsync({
     fields: [eventDateField, eventEnsembleField]
 });
-
 const rostersQuery = await rostersTable.selectRecordsAsync({
-    fields: [
-        rosterEnsembleField,
-        attendanceRosterField,
-        absenceRequestsField,
-        missedRehearsalsField
-    ]
+    fields: [rosterEnsembleField, attendanceRosterField,
+        absenceRequestsField, missedRehearsalsField]
 });
-
 const attendanceQuery = await attendanceTable.selectRecordsAsync({
     fields: [attendanceDateField, attendanceEnsembleField]
 });
 
-const attendanceDetailsById = new Map();
-
-for (const attendanceRecord of attendanceQuery.records) {
-    attendanceDetailsById.set(attendanceRecord.id, {
-        date: getDateOnly(attendanceRecord, attendanceDateField),
-        ensembleIds: getLinkedIds(
-            attendanceRecord,
-            attendanceEnsembleField
-        ),
-        ensembleNames: getReferenceNames(
-            attendanceRecord,
-            attendanceEnsembleField
-        )
+const attendanceById = new Map();
+for (const record of attendanceQuery.records) {
+    attendanceById.set(record.id, {
+        date: dateOnly(record, attendanceDateField),
+        ids: linkedIds(record, attendanceEnsembleField),
+        names: names(record, attendanceEnsembleField)
     });
 }
 
 const rosterDetails = new Map();
-
-for (const rosterRecord of rostersQuery.records) {
-    const attendedKeys = new Set();
-    const attendanceRecordIds = getLinkedIds(
-        rosterRecord,
-        attendanceRosterField
-    );
-
-    for (const attendanceRecordId of attendanceRecordIds) {
-        const attendance = attendanceDetailsById.get(attendanceRecordId);
-
-        if (!attendance || !attendance.date) {
-            continue;
+for (const record of rostersQuery.records) {
+    const attendanceKeys = new Set();
+    for (const attendanceId of linkedIds(record, attendanceRosterField)) {
+        const attendance = attendanceById.get(attendanceId);
+        if (!attendance || !attendance.date) continue;
+        for (const id of attendance.ids) {
+            attendanceKeys.add(attendance.date + "|id:" + id);
         }
-
-        for (const ensembleId of attendance.ensembleIds) {
-            attendedKeys.add(attendance.date + "|id:" + ensembleId);
-        }
-
-        for (const ensembleName of attendance.ensembleNames) {
-            attendedKeys.add(attendance.date + "|name:" + ensembleName);
+        for (const name of attendance.names) {
+            attendanceKeys.add(attendance.date + "|name:" + name);
         }
     }
 
-    rosterDetails.set(rosterRecord.id, {
-        ensembleIds: getLinkedIds(rosterRecord, rosterEnsembleField),
-        ensembleNames: getReferenceNames(rosterRecord, rosterEnsembleField),
-        attendedKeys: attendedKeys,
-        absenceRequestEventIds: getLinkedIds(
-            rosterRecord,
-            absenceRequestsField
-        ),
-        missedEventIds: new Set()
+    // Absence Requests are linked records whose displayed names are dates.
+    // Keep both their IDs and normalized dates. The date fallback handles
+    // cases where the linked record is not the same event record ID.
+    const absenceIds = linkedIds(record, absenceRequestsField);
+    const absenceDates = new Set();
+    for (const absenceName of names(record, absenceRequestsField)) {
+        const parts = absenceName.split("/");
+        if (parts.length === 3 && parts[2].length === 4) {
+            absenceDates.add(parts[2] + "-" + zero(parts[0]) + "-" + zero(parts[1]));
+        }
+    }
+
+    rosterDetails.set(record.id, {
+        ensembleIds: linkedIds(record, rosterEnsembleField),
+        ensembleNames: names(record, rosterEnsembleField),
+        attendanceKeys: attendanceKeys,
+        absenceIds: absenceIds,
+        absenceDates: absenceDates,
+        missedIds: new Set()
     });
 }
 
-for (const eventRecord of eventsQuery.records) {
-    const eventDate = getDateOnly(eventRecord, eventDateField);
+for (const event of eventsQuery.records) {
+    const date = dateOnly(event, eventDateField);
+    if (!date || date > today) continue;
 
-    if (!eventDate || eventDate > easternToday) {
-        continue;
-    }
-
-    const eventEnsembleIds = getLinkedIds(
-        eventRecord,
-        eventEnsembleField
-    );
-    const eventEnsembleNames = getReferenceNames(
-        eventRecord,
-        eventEnsembleField
-    );
-
-    if (eventEnsembleIds.size === 0 && eventEnsembleNames.size === 0) {
-        continue;
-    }
+    const eventIds = linkedIds(event, eventEnsembleField);
+    const eventNames = names(event, eventEnsembleField);
+    if (eventIds.size === 0 && eventNames.size === 0) continue;
 
     for (const roster of rosterDetails.values()) {
-        const sameEnsemble = hasCommonEnsemble(
-            eventEnsembleIds,
-            eventEnsembleNames,
-            roster.ensembleIds,
-            roster.ensembleNames
-        );
+        if (!common(eventIds, eventNames,
+            roster.ensembleIds, roster.ensembleNames)) continue;
 
-        if (!sameEnsemble) {
-            continue;
-        }
+        const attended = hasAttendance(roster, date, eventIds, eventNames);
+        const directlyExcused = roster.absenceIds.has(event.id);
+        const dateExcused = roster.absenceDates.has(date);
 
-        const attended = hasMatchingAttendance(
-            roster,
-            eventDate,
-            eventEnsembleIds,
-            eventEnsembleNames
-        );
-        const excused = roster.absenceRequestEventIds.has(eventRecord.id);
-
-        if (!attended && !excused) {
-            roster.missedEventIds.add(eventRecord.id);
+        if (!attended && !directlyExcused && !dateExcused) {
+            roster.missedIds.add(event.id);
         }
     }
 }
 
-// Rebuild Missed Rehearsals from scratch. This explicitly removes any stale
-// link that is now present in Attendance or Absence Requests, because only
-// genuinely missed event IDs are included in the replacement value.
 const updates = [];
-let staleLinksRemoved = 0;
+let staleRemoved = 0;
 
-for (const rosterRecord of rostersQuery.records) {
-    const roster = rosterDetails.get(rosterRecord.id);
-    const newMissedIds = Array.from(roster.missedEventIds);
-    const currentMissedIds = getLinkedIds(
-        rosterRecord,
-        missedRehearsalsField
-    );
+for (const record of rostersQuery.records) {
+    const roster = rosterDetails.get(record.id);
+    const newIds = Array.from(roster.missedIds);
+    const oldIds = linkedIds(record, missedRehearsalsField);
 
-    for (const currentMissedId of currentMissedIds) {
-        if (!roster.missedEventIds.has(currentMissedId)) {
-            staleLinksRemoved += 1;
-        }
+    for (const oldId of oldIds) {
+        if (!roster.missedIds.has(oldId)) staleRemoved++;
     }
 
-    const unchanged =
-        currentMissedIds.size === newMissedIds.length &&
-        newMissedIds.every(function (eventId) {
-            return currentMissedIds.has(eventId);
-        });
+    const unchanged = oldIds.size === newIds.length &&
+        newIds.every(function (id) { return oldIds.has(id); });
 
     if (!unchanged) {
         updates.push({
-            id: rosterRecord.id,
-            fields: {
-                [missedRehearsalsField]: newMissedIds.map(function (id) {
-                    return { id: id };
-                })
-            }
+            id: record.id,
+            fields: {}
         });
+        updates[updates.length - 1].fields[missedRehearsalsField] =
+            newIds.map(function (id) { return { id: id }; });
     }
 }
 
-// Airtable allows a maximum of 50 records per update request.
 for (let index = 0; index < updates.length; index += 50) {
-    await rostersTable.updateRecordsAsync(
-        updates.slice(index, index + 50)
-    );
+    await rostersTable.updateRecordsAsync(updates.slice(index, index + 50));
 }
 
-output.set("easternToday", easternToday);
+output.set("easternToday", today);
 output.set("eventsChecked", eventsQuery.records.length);
 output.set("rostersChecked", rostersQuery.records.length);
 output.set("attendanceRowsChecked", attendanceQuery.records.length);
 output.set("rostersUpdated", updates.length);
-output.set("staleMissedLinksRemoved", staleLinksRemoved);
+output.set("staleMissedLinksRemoved", staleRemoved);
